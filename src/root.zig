@@ -1,0 +1,489 @@
+const std = @import("std");
+const c = @import("c.zig").c;
+const config = @import("config.zig");
+const ui_mod = @import("ui.zig");
+const ihs = @import("ihs.zig");
+const decode = @import("decode.zig");
+const input = @import("input.zig");
+const Io = std.Io;
+const io = std.Options.debug_io;
+
+const Phase = enum {
+    scan,
+    reconnect_prompt,
+    pair,
+    streaming,
+    disconnected,
+    settings,
+    quit,
+};
+
+const SessionCtx = struct {
+    disconnected: std.atomic.Value(bool),
+    enable_hevc: bool,
+};
+
+fn onSessionDisconnected(
+    session: ?*c.IHS_Session,
+    ctx_ptr: ?*anyopaque,
+) callconv(.c) void {
+    _ = session;
+    const ctx: *SessionCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    ctx.disconnected.store(true, .release);
+}
+
+fn onSessionConfiguring(
+    session: ?*c.IHS_Session,
+    session_config: ?*c.IHS_SessionConfig,
+    ctx_ptr: ?*anyopaque,
+) callconv(.c) void {
+    _ = session;
+    const ctx: *SessionCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    const cfg = session_config.?;
+    cfg.enableAudio = true;
+    cfg.enableHevc = ctx.enable_hevc;
+}
+
+var session_callbacks = c.IHS_StreamSessionCallbacks{
+    .initialized = null,
+    .connecting = null,
+    .configuring = onSessionConfiguring,
+    .connected = null,
+    .disconnected = onSessionDisconnected,
+    .finalized = null,
+};
+
+const AppState = struct {
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    phase: Phase,
+    device: config.DeviceConfig,
+    paired: ?config.PairedHost,
+    settings: config.Settings,
+    ui: ui_mod.Ui,
+    selected_host: ?c.IHS_HostInfo,
+    decode_ctx: decode.DecodeCtx,
+
+    fn clientConfig(self: *const AppState) c.IHS_ClientConfig {
+        return .{
+            .deviceId = self.device.device_id,
+            .secretKey = &self.device.secret_key,
+            .deviceName = &self.device.device_name,
+        };
+    }
+};
+
+fn initAppState(allocator: std.mem.Allocator) !AppState {
+    const device = try config.loadOrCreate(allocator);
+    const paired = try config.loadPaired(allocator);
+    const settings = try config.loadSettings(allocator);
+    const ui = try ui_mod.Ui.init();
+
+    return AppState{
+        .allocator = allocator,
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .phase = .scan,
+        .device = device,
+        .paired = paired,
+        .settings = settings,
+        .ui = ui,
+        .selected_host = null,
+        .decode_ctx = decode.DecodeCtx.init(allocator),
+    };
+}
+
+fn deinitAppState(state: *AppState) void {
+    state.decode_ctx.deinit();
+    state.ui.deinit();
+    state.arena.deinit();
+}
+
+pub fn run(allocator: std.mem.Allocator) !void {
+    c.IHS_Init();
+    defer c.IHS_Quit();
+
+    var state = try initAppState(allocator);
+    defer deinitAppState(&state);
+
+    while (true) {
+        switch (state.phase) {
+            .scan => scanForHosts(&state),
+            .reconnect_prompt => reconnectPrompt(&state),
+            .pair => pairWithPin(&state) catch |err| {
+                std.log.err("pair error: {}", .{err});
+                state.phase = .scan;
+            },
+            .streaming => beginStreaming(&state) catch |err| {
+                std.log.err("streaming error: {}", .{err});
+                state.phase = .disconnected;
+            },
+            .disconnected => {
+                state.ui.drawStatus("Disconnected. Press A to return.");
+                waitForA(&state);
+                state.phase = .scan;
+            },
+            .settings => {
+                settingsScreen(&state);
+                state.phase = .scan;
+            },
+            .quit => break,
+        }
+    }
+}
+
+// ── Scan ──────────────────────────────────────────────────────────────────────
+
+fn scanForHosts(state: *AppState) void {
+    state.ui.host_cursor = 0;
+
+    const cfg = state.clientConfig();
+    const paired_client_id: u64 = if (state.paired) |p| p.client_id else 0;
+
+    var disc_ctx = ihs.DiscoveryCtx.init(state.allocator);
+    defer disc_ctx.deinit();
+
+    const disc_thread = ihs.startDiscovery(&disc_ctx, cfg, 5000) catch {
+        state.ui.drawStatus("Discovery failed to start.");
+        io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
+        return;
+    };
+    defer disc_thread.join();
+
+    while (true) {
+        // Grab a snapshot of discovered hosts using the general allocator.
+        const hosts = disc_ctx.copyHosts(state.allocator) catch &.{};
+        defer if (hosts.len > 0) state.allocator.free(hosts);
+
+        const scanning = !disc_ctx.done.load(.acquire);
+        state.ui.drawScanScreen(hosts, paired_client_id, scanning);
+
+        const ev = state.ui.pollEvents();
+        switch (ev) {
+            .quit => {
+                state.phase = .quit;
+                disc_ctx.stop();
+                return;
+            },
+            .button_start => {
+                state.phase = .settings;
+                disc_ctx.stop();
+                return;
+            },
+            .dpad_up => state.ui.moveScanCursor(-1, hosts.len),
+            .dpad_down => state.ui.moveScanCursor(1, hosts.len),
+            .button_a => {
+                const idx = state.ui.selectedHostIndex();
+                if (idx < hosts.len) {
+                    state.selected_host = hosts[idx];
+                    disc_ctx.stop();
+                    const sel = state.selected_host.?;
+                    if (state.paired) |p| {
+                        state.phase = if (sel.clientId == p.client_id) .reconnect_prompt else .pair;
+                    } else {
+                        state.phase = .pair;
+                    }
+                    return;
+                }
+            },
+            else => {},
+        }
+
+        // Timeout with no hosts found
+        if (disc_ctx.done.load(.acquire) and hosts.len == 0) {
+            state.ui.drawStatus("No hosts found. Press A to rescan.");
+            waitForA(state);
+            // Re-enter scan from the outer phase loop
+            return;
+        }
+
+        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+    }
+}
+
+// ── Reconnect prompt ──────────────────────────────────────────────────────────
+
+fn reconnectPrompt(state: *AppState) void {
+    state.ui.reconnect_choice = .reconnect;
+    const p = state.paired.?;
+    const name_len = std.mem.indexOfScalar(u8, &p.hostname, 0) orelse p.hostname.len;
+    const hostname = p.hostname[0..name_len];
+
+    while (true) {
+        state.ui.drawReconnectScreen(hostname);
+        switch (state.ui.pollEvents()) {
+            .quit => {
+                state.phase = .quit;
+                return;
+            },
+            .dpad_left, .dpad_right => state.ui.reconnectToggle(),
+            .button_a => {
+                state.phase = switch (state.ui.reconnect_choice) {
+                    .reconnect => .streaming,
+                    .new_pair => .pair,
+                };
+                return;
+            },
+            .button_b => {
+                state.phase = .scan;
+                return;
+            },
+            else => {},
+        }
+        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+    }
+}
+
+// ── Pair ──────────────────────────────────────────────────────────────────────
+
+fn pairWithPin(state: *AppState) !void {
+    const host = state.selected_host orelse return error.NoHost;
+    var attempts: u8 = 0;
+
+    while (attempts < 3) : (attempts += 1) {
+        state.ui.resetPin();
+
+        // Collect PIN via padlock UI
+        var pin_collected = false;
+        var pin_buf: [5]u8 = undefined;
+        while (!pin_collected) {
+            state.ui.drawPinScreen();
+            switch (state.ui.pollEvents()) {
+                .quit => {
+                    state.phase = .quit;
+                    return;
+                },
+                .button_b => {
+                    state.phase = .scan;
+                    return;
+                },
+                .dpad_up => state.ui.pinAdjustDigit(1),
+                .dpad_down => state.ui.pinAdjustDigit(-1),
+                .dpad_left => state.ui.pinMoveSlot(-1),
+                .dpad_right => state.ui.pinMoveSlot(1),
+                .button_a => {
+                    state.ui.pinString(&pin_buf);
+                    pin_collected = true;
+                },
+                else => {},
+            }
+            io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+        }
+
+        state.ui.pin_status = .waiting;
+
+        // Kick off auth in background
+        var auth_ctx = ihs.AuthCtx.init();
+        const cfg = state.clientConfig();
+        const auth_thread = try ihs.startAuthorize(&auth_ctx, cfg, host, pin_buf[0..4]);
+
+        while (!auth_ctx.done.load(.acquire)) {
+            state.ui.drawPinScreen();
+            const ev = state.ui.pollEvents();
+            if (ev == .quit) {
+                state.phase = .quit;
+                auth_thread.join();
+                return;
+            }
+            if (ev == .button_b) {
+                state.phase = .scan;
+                auth_thread.join();
+                return;
+            }
+            io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+        }
+        auth_thread.join();
+
+        switch (auth_ctx.result) {
+            .success => {
+                var paired_host = std.mem.zeroes(config.PairedHost);
+                @memcpy(paired_host.hostname[0..host.hostname.len], &host.hostname);
+                paired_host.client_id = host.clientId;
+                paired_host.instance_id = host.instanceId;
+                paired_host.steam_id = auth_ctx.steam_id;
+                state.paired = paired_host;
+                try config.savePaired(state.allocator, paired_host);
+                state.phase = .streaming;
+                return;
+            },
+            .denied => {
+                state.ui.pin_status = .denied;
+                state.ui.drawPinScreen();
+                io.sleep(.fromNanoseconds(1500 * std.time.ns_per_ms), .awake) catch {};
+                // retry
+            },
+            .failed => {
+                state.ui.pin_status = .failed;
+                state.ui.drawPinScreen();
+                io.sleep(.fromNanoseconds(1500 * std.time.ns_per_ms), .awake) catch {};
+                state.phase = .scan;
+                return;
+            },
+        }
+    }
+
+    // 3 denied attempts → back to scan
+    state.phase = .scan;
+}
+
+// ── Streaming ─────────────────────────────────────────────────────────────────
+
+fn beginStreaming(state: *AppState) !void {
+    const host = state.selected_host orelse return error.NoHost;
+    const cfg = state.clientConfig();
+
+    // Request stream
+    state.ui.drawStatus("Requesting stream...");
+    var stream_ctx = ihs.StreamRequestCtx.init();
+    const stream_thread = try ihs.startStreamRequest(
+        &stream_ctx,
+        cfg,
+        host,
+        @intCast(state.settings.width),
+        @intCast(state.settings.height),
+    );
+    stream_thread.join();
+
+    if (stream_ctx.result != .success) {
+        const msg: [:0]const u8 = switch (stream_ctx.result) {
+            .unauthorized => "Stream request rejected: not authorized.",
+            else => "Stream request failed.",
+        };
+        state.ui.drawStatus(msg);
+        io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
+        state.phase = .disconnected;
+        return;
+    }
+
+    // Create session
+    var session_info = stream_ctx.session_info;
+    const session = c.IHS_SessionCreate(&cfg, &session_info) orelse {
+        state.ui.drawStatus("Failed to create session.");
+        io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
+        state.phase = .disconnected;
+        return;
+    };
+    defer c.IHS_SessionDestroy(session);
+
+    // Set callbacks
+    var sess_ctx = SessionCtx{
+        .disconnected = std.atomic.Value(bool).init(false),
+        .enable_hevc = state.settings.enable_hevc,
+    };
+    c.IHS_SessionSetSessionCallbacks(session, &session_callbacks, &sess_ctx);
+    c.IHS_SessionSetVideoCallbacks(session, &decode.video_callbacks, &state.decode_ctx);
+    c.IHS_SessionSetAudioCallbacks(session, &decode.audio_callbacks, &state.decode_ctx);
+
+    // HID input passthrough
+    input.init(session);
+    defer input.deinit();
+
+    state.ui.drawStatus("Connecting...");
+    if (!c.IHS_SessionConnect(session)) {
+        state.ui.drawStatus("Session connect failed.");
+        io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
+        state.phase = .disconnected;
+        return;
+    }
+
+    // Create streaming texture (allocate lazily on first frame)
+    var texture: ?*c.SDL_Texture = null;
+    var tex_w: u32 = 0;
+    var tex_h: u32 = 0;
+    defer if (texture) |t| c.SDL_DestroyTexture(t);
+
+    // Presentation loop
+    var frame: decode.VideoFrame = undefined;
+    while (!sess_ctx.disconnected.load(.acquire)) {
+        var event: c.SDL_Event = undefined;
+        while (c.SDL_PollEvent(&event) != 0) {
+            if (event.type == c.SDL_QUIT) {
+                state.phase = .quit;
+                c.IHS_SessionDisconnect(session);
+                break;
+            }
+            _ = input.handleEvent(session, &event);
+        }
+        if (state.phase == .quit) break;
+
+        if (state.decode_ctx.getNextFrame(&frame)) {
+            // Recreate texture if resolution changed
+            if (texture == null or frame.width != tex_w or frame.height != tex_h) {
+                if (texture) |t| c.SDL_DestroyTexture(t);
+                texture = c.SDL_CreateTexture(
+                    state.ui.renderer,
+                    c.SDL_PIXELFORMAT_IYUV,
+                    c.SDL_TEXTUREACCESS_STREAMING,
+                    @intCast(frame.width),
+                    @intCast(frame.height),
+                );
+                tex_w = frame.width;
+                tex_h = frame.height;
+            }
+            if (texture) |t| {
+                _ = c.SDL_UpdateYUVTexture(t, null, frame.y.ptr, frame.y_stride, frame.u.ptr, frame.u_stride, frame.v.ptr, frame.v_stride);
+            }
+            frame.deinit();
+        }
+
+        _ = c.SDL_SetRenderDrawColor(state.ui.renderer, 0, 0, 0, 255);
+        _ = c.SDL_RenderClear(state.ui.renderer);
+        if (texture) |t| _ = c.SDL_RenderCopy(state.ui.renderer, t, null, null);
+        c.SDL_RenderPresent(state.ui.renderer);
+    }
+
+    c.IHS_SessionDisconnect(session);
+    c.IHS_SessionThreadedJoin(session);
+
+    if (state.phase != .quit) state.phase = .disconnected;
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+fn settingsScreen(state: *AppState) void {
+    state.ui.settings_row = 0;
+    var s = state.settings;
+
+    while (true) {
+        state.ui.drawSettingsScreen(s);
+        switch (state.ui.pollEvents()) {
+            .quit => {
+                state.phase = .quit;
+                return;
+            },
+            .button_b, .button_start => {
+                state.settings = s;
+                config.saveSettings(state.allocator, s) catch {};
+                return;
+            },
+            .dpad_up => state.ui.settingsMoveRow(-1),
+            .dpad_down => state.ui.settingsMoveRow(1),
+            .dpad_left => state.ui.settingsAdjust(&s, -1),
+            .dpad_right => state.ui.settingsAdjust(&s, 1),
+            else => {},
+        }
+        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn waitForA(state: *AppState) void {
+    while (true) {
+        switch (state.ui.pollEvents()) {
+            .button_a, .quit => return,
+            else => {},
+        }
+        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+    }
+}
+
+fn waitForAorB(state: *AppState) ui_mod.UiEvent {
+    while (true) {
+        const ev = state.ui.pollEvents();
+        switch (ev) {
+            .button_a, .button_b, .quit => return ev,
+            else => {},
+        }
+        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+    }
+}

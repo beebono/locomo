@@ -1,0 +1,15 @@
+[submodule "external/ihslib"]
+	path = external/ihslib
+	url = https://github.com/beebono/ihslib.git
+[submodule "external/SDL2"]
+	path = external/SDL2
+	url = https://github.com/libsdl-org/SDL.git
+	branch = SDL2
+[submodule "external/ffmpeg"]
+	path = external/ffmpeg
+	url = https://github.com/FFmpeg/FFmpeg.git
+	branch = release/8.1
+[submodule "external/SDL2_ttf"]
+	path = external/SDL2_ttf
+	url = https://github.com/libsdl-org/SDL_ttf.git
+	branch = SDL2
