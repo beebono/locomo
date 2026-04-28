@@ -36,16 +36,10 @@ pub const Ui = struct {
     font: *c.TTF_Font,
     font_small: *c.TTF_Font,
 
-    // Scan screen state
+    // Tracked screen states
     host_cursor: usize = 0,
-
-    // PIN screen state
     pin_status: PinStatus = .idle,
-
-    // Reconnect screen state
     reconnect_choice: ReconnectChoice = .reconnect,
-
-    // Settings screen state
     settings_row: u8 = 0,
 
     pub fn init() !Ui {
@@ -179,7 +173,7 @@ pub const Ui = struct {
         _ = c.SDL_RenderDrawRect(self.renderer, &r);
     }
 
-    // ── Scan screen ──────────────────────────────────────────────────────────
+    // Screen: Host Scanning
 
     pub fn drawScanScreen(
         self: *Ui,
@@ -235,7 +229,7 @@ pub const Ui = struct {
         return self.host_cursor;
     }
 
-    // ── Status screen ────────────────────────────────────────────────────────
+    // Screen: Statuses
 
     pub fn drawStatus(self: *Ui, msg: [:0]const u8) void {
         self.clear();
@@ -243,7 +237,7 @@ pub const Ui = struct {
         self.present();
     }
 
-    // ── Reconnect prompt ─────────────────────────────────────────────────────
+    // Screen: Reconnect - TODO: Reevaluate need for this... see similar in root.zig
 
     pub fn drawReconnectScreen(self: *Ui, hostname: []const u8) void {
         self.clear();
@@ -283,7 +277,7 @@ pub const Ui = struct {
         };
     }
 
-    // ── PIN screen ───────────────────────────────────────────────────────────
+    // Screen: PIN
 
     pub fn resetPin(self: *Ui) void {
         self.pin_status = .idle;
@@ -328,7 +322,7 @@ pub const Ui = struct {
         self.present();
     }
 
-    // ── Settings screen ──────────────────────────────────────────────────────
+    // Screen: Settings
 
     const res_labels = [_][:0]const u8{ "1280x720", "1920x1080", "2560x1440" };
     const bw_labels = [_][:0]const u8{ "5 Mbps", "10 Mbps", "20 Mbps", "30 Mbps", "Unlimited" };

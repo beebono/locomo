@@ -3,7 +3,7 @@ const Io = std.Io;
 const io = std.Options.debug_io;
 const c = @import("c.zig").c;
 
-// ── Discovery ─────────────────────────────────────────────────────────────────
+// Host Discovery
 
 pub const DiscoveryCtx = struct {
     allocator: std.mem.Allocator,
@@ -52,7 +52,6 @@ fn onHostDiscovered(
     const ctx: *DiscoveryCtx = @ptrCast(@alignCast(ctx_ptr.?));
     while (!ctx.mutex.tryLock()) {}
     defer ctx.mutex.unlock();
-    // deduplicate by clientId
     for (ctx.hosts.items) |existing| {
         if (existing.clientId == info.?.clientId) return;
     }
@@ -68,8 +67,6 @@ fn discoveryThread(args: DiscoveryArgs) void {
     c.IHS_ClientSetDiscoveryCallbacks(client, &discovery_callbacks, args.ctx);
     _ = c.IHS_ClientStartDiscovery(client, 2000);
 
-    // Poll for stop signal or timeout in 50 ms steps so the thread is
-    // interruptible when the caller finds a host before the timeout expires.
     const deadline_ns = Io.Clock.awake.now(io).toNanoseconds() + @as(i128, @intCast(args.timeout_ms)) * std.time.ns_per_ms;
     while (!args.ctx.should_stop.load(.acquire) and Io.Clock.awake.now(io).toNanoseconds() < deadline_ns) {
         io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
@@ -87,7 +84,7 @@ pub fn startDiscovery(ctx: *DiscoveryCtx, cfg: c.IHS_ClientConfig, timeout_ms: u
     return std.Thread.spawn(.{}, discoveryThread, .{args});
 }
 
-// ── Authorization ─────────────────────────────────────────────────────────────
+// Authorization
 
 pub const AuthResult = enum { success, denied, failed };
 
@@ -163,11 +160,6 @@ fn authThread(args: AuthArgs) void {
     };
     c.IHS_ClientSetAuthorizationCallbacks(client, &auth_callbacks, args.ctx);
     _ = c.IHS_ClientStartDiscovery(client, 0);
-    // Wait until we find the host, then request auth. The discovery callback
-    // fires once; we do auth from there via a one-shot flag in the client loop.
-    // Simpler: use a separate ctx that triggers auth on first host discovery.
-    // Re-use host from args directly via IHS_ClientAuthorizationRequest after
-    // brief discovery to locate the host on the network.
     var auth_host = args.host;
     _ = c.IHS_ClientAuthorizationRequest(client, &auth_host, &args.pin);
     c.IHS_ClientThreadedJoin(client);
@@ -182,7 +174,7 @@ pub fn startAuthorize(ctx: *AuthCtx, cfg: c.IHS_ClientConfig, host: c.IHS_HostIn
     return std.Thread.spawn(.{}, authThread, .{args});
 }
 
-// ── Streaming request ─────────────────────────────────────────────────────────
+// Stream Requests
 
 pub const StreamResult = enum { success, failed, unauthorized };
 

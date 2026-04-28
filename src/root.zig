@@ -22,6 +22,7 @@ const SessionCtx = struct {
     disconnected: std.atomic.Value(bool),
     connected: std.atomic.Value(bool),
     enable_hevc: bool,
+    max_bandwidth_kbps: u32,
 };
 
 fn onSessionConnected(
@@ -69,6 +70,7 @@ fn onSessionConfiguring(
     const cfg = session_config.?;
     cfg.enableAudio = true;
     cfg.enableHevc = ctx.enable_hevc;
+    cfg.maxBitrateKbps = ctx.max_bandwidth_kbps;
 }
 
 var session_callbacks = c.IHS_StreamSessionCallbacks{
@@ -158,7 +160,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     }
 }
 
-// ── Scan ──────────────────────────────────────────────────────────────────────
+// Scanning
 
 fn scanForHosts(state: *AppState) void {
     state.ui.host_cursor = 0;
@@ -177,7 +179,6 @@ fn scanForHosts(state: *AppState) void {
     defer disc_thread.join();
 
     while (true) {
-        // Grab a snapshot of discovered hosts using the general allocator.
         const hosts = disc_ctx.copyHosts(state.allocator) catch &.{};
         defer if (hosts.len > 0) state.allocator.free(hosts);
 
@@ -215,11 +216,9 @@ fn scanForHosts(state: *AppState) void {
             else => {},
         }
 
-        // Timeout with no hosts found
         if (disc_ctx.done.load(.acquire) and hosts.len == 0) {
             state.ui.drawStatus("No hosts found. Press A to rescan.");
             waitForA(state);
-            // Re-enter scan from the outer phase loop
             return;
         }
 
@@ -227,7 +226,7 @@ fn scanForHosts(state: *AppState) void {
     }
 }
 
-// ── Reconnect prompt ──────────────────────────────────────────────────────────
+// Reconnect prompt - TODO: Reevaluate need for this... Probably better to not display paired state and only attempt to re-pair if reconnect fails?
 
 fn reconnectPrompt(state: *AppState) void {
     state.ui.reconnect_choice = .reconnect;
@@ -260,7 +259,7 @@ fn reconnectPrompt(state: *AppState) void {
     }
 }
 
-// ── Pair ──────────────────────────────────────────────────────────────────────
+// Pairing
 
 fn pairWithPin(state: *AppState) !void {
     const host = state.selected_host orelse return error.NoHost;
@@ -319,13 +318,12 @@ fn pairWithPin(state: *AppState) !void {
     }
 }
 
-// ── Streaming ─────────────────────────────────────────────────────────────────
+// Streaming
 
 fn beginStreaming(state: *AppState) !void {
     const host = state.selected_host orelse return error.NoHost;
     const cfg = state.clientConfig();
 
-    // Request stream
     state.ui.drawStatus("Requesting stream...");
     var stream_ctx = ihs.StreamRequestCtx.init();
     const stream_thread = try ihs.startStreamRequest(
@@ -349,7 +347,6 @@ fn beginStreaming(state: *AppState) !void {
         return;
     }
 
-    // Create session
     var session_info = stream_ctx.session_info;
     const session = c.IHS_SessionCreate(&cfg, &session_info) orelse {
         state.ui.drawStatus("Failed to create session.");
@@ -360,11 +357,11 @@ fn beginStreaming(state: *AppState) !void {
     c.IHS_SessionSetLogFunction(session, logPrint);
     defer c.IHS_SessionDestroy(session);
 
-    // Set callbacks
     var sess_ctx = SessionCtx{
         .disconnected = std.atomic.Value(bool).init(false),
         .connected = std.atomic.Value(bool).init(false),
         .enable_hevc = state.settings.enable_hevc,
+        .max_bandwidth_kbps = state.settings.max_bandwidth_kbps,
     };
     c.IHS_SessionSetSessionCallbacks(session, &session_callbacks, &sess_ctx);
     c.IHS_SessionSetVideoCallbacks(session, &decode.video_callbacks, &state.decode_ctx);
@@ -378,18 +375,16 @@ fn beginStreaming(state: *AppState) !void {
         return;
     }
 
-    // HID input passthrough, defer until connected or Host immediately
+    // Gamepad input passthrough, defer until connected or Host immediately
     // refuses the connection thinking something went wrong.
     var hid_initialized = false;
     defer if (hid_initialized) input.deinit();
 
-    // Create streaming texture (allocate lazily on first frame)
     var texture: ?*c.SDL_Texture = null;
     var tex_w: u32 = 0;
     var tex_h: u32 = 0;
     defer if (texture) |t| c.SDL_DestroyTexture(t);
 
-    // Presentation loop
     var frame: decode.VideoFrame = undefined;
     while (!sess_ctx.disconnected.load(.acquire)) {
         if (!hid_initialized and sess_ctx.connected.load(.acquire)) {
@@ -408,7 +403,6 @@ fn beginStreaming(state: *AppState) !void {
         if (state.phase == .quit) break;
 
         if (state.decode_ctx.getNextFrame(&frame)) {
-            // Recreate texture if resolution changed
             if (texture == null or frame.width != tex_w or frame.height != tex_h) {
                 if (texture) |t| c.SDL_DestroyTexture(t);
                 texture = c.SDL_CreateTexture(
@@ -439,7 +433,7 @@ fn beginStreaming(state: *AppState) !void {
     if (state.phase != .quit) state.phase = .disconnected;
 }
 
-// ── Settings ──────────────────────────────────────────────────────────────────
+// Settings
 
 fn settingsScreen(state: *AppState) void {
     state.ui.settings_row = 0;
@@ -467,7 +461,7 @@ fn settingsScreen(state: *AppState) void {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Button helpers
 
 fn waitForA(state: *AppState) void {
     while (true) {
