@@ -1,5 +1,93 @@
 const std = @import("std");
 const c = @import("c.zig").c;
+const io = std.Options.debug_io;
+
+// Sized to comfortably hold a 1080p H.264 IDR (typically 100–250 KB).
+const SLOT_CAP: usize = 512 * 1024;
+const RING_SLOTS: usize = 8;
+
+const PacketSlot = struct {
+    data: [SLOT_CAP]u8 = undefined,
+    len: usize = 0,
+    is_keyframe: bool = false,
+};
+
+const PacketRing = struct {
+    slots: []PacketSlot,
+    head: usize, // producer write index
+    tail: usize, // consumer read index
+    count: usize, // filled slots
+    mutex: std.Io.Mutex,
+    not_empty: std.Io.Condition,
+    shutdown: bool,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) !PacketRing {
+        const slots = try allocator.alloc(PacketSlot, RING_SLOTS);
+        for (slots) |*s| {
+            s.len = 0;
+            s.is_keyframe = false;
+        }
+        return .{
+            .slots = slots,
+            .head = 0,
+            .tail = 0,
+            .count = 0,
+            .mutex = .init,
+            .not_empty = .init,
+            .shutdown = false,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *PacketRing) void {
+        self.allocator.free(self.slots);
+    }
+
+    /// Producer side. Returns false if the ring was full or the packet was
+    /// too big to fit a slot — in either case the caller should treat it as
+    /// a frame loss and ask the host for a keyframe.
+    pub fn tryPush(self: *PacketRing, src: []const u8, is_keyframe: bool) bool {
+        if (src.len > SLOT_CAP) return false;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.count == self.slots.len) return false;
+        const slot = &self.slots[self.head];
+        @memcpy(slot.data[0..src.len], src);
+        slot.len = src.len;
+        slot.is_keyframe = is_keyframe;
+        self.head = (self.head + 1) % self.slots.len;
+        self.count += 1;
+        self.not_empty.signal(io);
+        return true;
+    }
+
+    /// Consumer side. Blocks until a packet is available or shutdown. On
+    /// success copies the packet bytes into `dst` and returns the length.
+    /// Returns null when the ring has been shut down and is drained.
+    pub fn pop(self: *PacketRing, dst: []u8, is_keyframe: *bool) ?usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (self.count == 0 and !self.shutdown) {
+            self.not_empty.waitUncancelable(io, &self.mutex);
+        }
+        if (self.count == 0) return null; // shutdown + drained
+        const slot = &self.slots[self.tail];
+        const n = slot.len;
+        @memcpy(dst[0..n], slot.data[0..n]);
+        is_keyframe.* = slot.is_keyframe;
+        self.tail = (self.tail + 1) % self.slots.len;
+        self.count -= 1;
+        return n;
+    }
+
+    pub fn requestStop(self: *PacketRing) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.shutdown = true;
+        self.not_empty.broadcast(io);
+    }
+};
 
 pub const VideoFrame = struct {
     y: []u8,
@@ -29,6 +117,8 @@ pub const DecodeCtx = struct {
     av_yuv_frame: ?*c.AVFrame,
     pending_frame: ?VideoFrame,
     frame_ready: std.atomic.Value(bool),
+    video_ring: ?PacketRing,
+    video_thread: ?std.Thread,
 
     // Audio
     audio_codec_ctx: ?*c.AVCodecContext,
@@ -46,6 +136,8 @@ pub const DecodeCtx = struct {
             .av_yuv_frame = null,
             .pending_frame = null,
             .frame_ready = std.atomic.Value(bool).init(false),
+            .video_ring = null,
+            .video_thread = null,
             .audio_codec_ctx = null,
             .audio_swr_ctx = null,
             .audio_device = 0,
@@ -55,6 +147,15 @@ pub const DecodeCtx = struct {
     }
 
     pub fn deinit(self: *DecodeCtx) void {
+        if (self.video_ring) |*r| r.requestStop();
+        if (self.video_thread) |t| {
+            t.join();
+            self.video_thread = null;
+        }
+        if (self.video_ring) |*r| {
+            r.deinit();
+            self.video_ring = null;
+        }
         if (self.pending_frame) |*f| f.deinit();
         self.pending_frame = null;
         if (self.av_yuv_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
@@ -93,31 +194,66 @@ fn videoStart(
         else => c.AV_CODEC_ID_H264,
     };
 
-    // Try hardware decoder first, fall back to software.
-    const hw_name: [*c]const u8 = if (codec_id == c.AV_CODEC_ID_HEVC) "hevc_v4l2m2m" else "h264_v4l2m2m";
-    const codec = c.avcodec_find_decoder_by_name(hw_name) orelse c.avcodec_find_decoder(codec_id) orelse return -1;
+    const sw_codec = c.avcodec_find_decoder(codec_id) orelse return -1;
 
-    const codec_ctx = c.avcodec_alloc_context3(codec) orelse return -1;
-    codec_ctx.*.width = @intCast(cfg.width);
-    codec_ctx.*.height = @intCast(cfg.height);
-
-    if (cfg.codecDataLen > 0 and cfg.codecData != null) {
-        codec_ctx.*.extradata = @ptrCast(c.av_malloc(cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE));
-        if (codec_ctx.*.extradata != null) {
-            @memcpy(codec_ctx.*.extradata[0..cfg.codecDataLen], cfg.codecData[0..cfg.codecDataLen]);
-            @memset(codec_ctx.*.extradata[cfg.codecDataLen .. cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE], 0);
-            codec_ctx.*.extradata_size = @intCast(cfg.codecDataLen);
+    // Try hardware decoder first; if it fails to open, fall back to software.
+    const codec_ctx: *c.AVCodecContext = hw: {
+        const hw_name: [*c]const u8 = if (codec_id == c.AV_CODEC_ID_HEVC) "hevc_v4l2m2m" else "h264_v4l2m2m";
+        if (c.avcodec_find_decoder_by_name(hw_name)) |hw_codec| {
+            if (c.avcodec_alloc_context3(hw_codec)) |hw_ctx| {
+                hw_ctx.*.width = @intCast(cfg.width);
+                hw_ctx.*.height = @intCast(cfg.height);
+                if (cfg.codecDataLen > 0 and cfg.codecData != null) {
+                    hw_ctx.*.extradata = @ptrCast(c.av_malloc(cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE));
+                    if (hw_ctx.*.extradata != null) {
+                        @memcpy(hw_ctx.*.extradata[0..cfg.codecDataLen], cfg.codecData[0..cfg.codecDataLen]);
+                        @memset(hw_ctx.*.extradata[cfg.codecDataLen .. cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE], 0);
+                        hw_ctx.*.extradata_size = @intCast(cfg.codecDataLen);
+                    }
+                }
+                _ = c.av_hwdevice_ctx_create(&hw_ctx.*.hw_device_ctx, c.AV_HWDEVICE_TYPE_DRM, "/dev/dri/card0", null, 0);
+                if (c.avcodec_open2(hw_ctx, hw_codec, null) == 0) break :hw hw_ctx;
+                c.avcodec_free_context(@ptrCast(@constCast(&hw_ctx)));
+            }
         }
-    }
-
-    if (c.avcodec_open2(codec_ctx, codec, null) < 0) {
-        c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
-        return -1;
-    }
+        const sw_ctx = c.avcodec_alloc_context3(sw_codec) orelse return -1;
+        sw_ctx.*.width = @intCast(cfg.width);
+        sw_ctx.*.height = @intCast(cfg.height);
+        if (cfg.codecDataLen > 0 and cfg.codecData != null) {
+            sw_ctx.*.extradata = @ptrCast(c.av_malloc(cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE));
+            if (sw_ctx.*.extradata != null) {
+                @memcpy(sw_ctx.*.extradata[0..cfg.codecDataLen], cfg.codecData[0..cfg.codecDataLen]);
+                @memset(sw_ctx.*.extradata[cfg.codecDataLen .. cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE], 0);
+                sw_ctx.*.extradata_size = @intCast(cfg.codecDataLen);
+            }
+        }
+        if (c.avcodec_open2(sw_ctx, sw_codec, null) < 0) {
+            c.avcodec_free_context(@ptrCast(@constCast(&sw_ctx)));
+            return -1;
+        }
+        break :hw sw_ctx;
+    };
 
     ctx.video_codec_ctx = codec_ctx;
     ctx.av_frame = c.av_frame_alloc();
     ctx.av_yuv_frame = c.av_frame_alloc();
+
+    // Spin up the encoded-packet ring and the decode thread. The IHS
+    // network thread will only memcpy into the ring inside videoSubmit;
+    // all heavy work (decode + scale + plane copy) runs on this thread.
+    ctx.video_ring = PacketRing.init(ctx.allocator) catch {
+        c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
+        ctx.video_codec_ctx = null;
+        return -1;
+    };
+    ctx.video_thread = std.Thread.spawn(.{}, videoDecodeThread, .{ctx}) catch {
+        ctx.video_ring.?.deinit();
+        ctx.video_ring = null;
+        c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
+        ctx.video_codec_ctx = null;
+        return -1;
+    };
+
     return 0;
 }
 
@@ -128,102 +264,117 @@ fn videoSubmit(
     ctx_ptr: ?*anyopaque,
 ) callconv(.c) c.IHS_StreamVideoSubmitResult {
     _ = session;
-    _ = flags;
     const ctx: *DecodeCtx = @ptrCast(@alignCast(ctx_ptr.?));
-    const codec_ctx = ctx.video_codec_ctx orelse return c.IHS_StreamVideoSubmitError;
-    const av_frame = ctx.av_frame orelse return c.IHS_StreamVideoSubmitError;
+    const ring = if (ctx.video_ring) |*r| r else return c.IHS_StreamVideoSubmitError;
 
     const buf = data.?;
     const data_ptr = c.IHS_BufferPointer(buf);
     const data_len = buf.size;
+    const is_keyframe = (flags & c.IHS_StreamVideoFrameKeyFrame) != 0;
 
-    const pkt = c.av_packet_alloc() orelse return c.IHS_StreamVideoSubmitError;
-    defer c.av_packet_free(@ptrCast(@constCast(&pkt)));
-
-    if (c.av_new_packet(pkt, @intCast(data_len)) < 0) return c.IHS_StreamVideoSubmitError;
-    @memcpy(pkt.*.data[0..data_len], data_ptr[0..data_len]);
-
-    if (c.avcodec_send_packet(codec_ctx, pkt) < 0) return c.IHS_StreamVideoSubmitOK;
-
-    while (c.avcodec_receive_frame(codec_ctx, av_frame) == 0) {
-        defer c.av_frame_unref(av_frame);
-
-        // Convert to YUV420P if needed
-        const yuv_frame = ctx.av_yuv_frame.?;
-        const w = av_frame.width;
-        const h = av_frame.height;
-
-        const sws = c.sws_getCachedContext(
-            ctx.video_sws_ctx,
-            w,
-            h,
-            av_frame.format,
-            w,
-            h,
-            c.AV_PIX_FMT_YUV420P,
-            c.SWS_BILINEAR,
-            null,
-            null,
-            null,
-        );
-        ctx.video_sws_ctx = sws;
-        if (sws == null) continue;
-
-        yuv_frame.width = w;
-        yuv_frame.height = h;
-        yuv_frame.format = c.AV_PIX_FMT_YUV420P;
-        if (c.av_frame_get_buffer(yuv_frame, 1) < 0) continue;
-        _ = c.sws_scale(sws, @ptrCast(&av_frame.data), @ptrCast(&av_frame.linesize), 0, h, @ptrCast(&yuv_frame.data), @ptrCast(&yuv_frame.linesize));
-
-        // Copy planes to CPU buffer for main-thread SDL upload
-        const y_sz: usize = @intCast(yuv_frame.linesize[0] * h);
-        const u_sz: usize = @intCast(yuv_frame.linesize[1] * @divTrunc(h, 2));
-        const v_sz: usize = @intCast(yuv_frame.linesize[2] * @divTrunc(h, 2));
-
-        const plane_y = ctx.allocator.alloc(u8, y_sz) catch {
-            c.av_frame_unref(yuv_frame);
-            continue;
-        };
-        const plane_u = ctx.allocator.alloc(u8, u_sz) catch {
-            ctx.allocator.free(plane_y);
-            c.av_frame_unref(yuv_frame);
-            continue;
-        };
-        const plane_v = ctx.allocator.alloc(u8, v_sz) catch {
-            ctx.allocator.free(plane_y);
-            ctx.allocator.free(plane_u);
-            c.av_frame_unref(yuv_frame);
-            continue;
-        };
-
-        const new_frame = VideoFrame{
-            .y = plane_y,
-            .u = plane_u,
-            .v = plane_v,
-            .width = @intCast(w),
-            .height = @intCast(h),
-            .y_stride = yuv_frame.linesize[0],
-            .u_stride = yuv_frame.linesize[1],
-            .v_stride = yuv_frame.linesize[2],
-            .allocator = ctx.allocator,
-        };
-
-        @memcpy(new_frame.y, yuv_frame.data[0][0..y_sz]);
-        @memcpy(new_frame.u, yuv_frame.data[1][0..u_sz]);
-        @memcpy(new_frame.v, yuv_frame.data[2][0..v_sz]);
-        c.av_frame_unref(yuv_frame);
-
-        if (ctx.frame_ready.load(.acquire)) {
-            // Main thread hasn't consumed the previous frame; drop this one.
-            ctx.allocator.free(new_frame.y);
-            ctx.allocator.free(new_frame.u);
-            ctx.allocator.free(new_frame.v);
-        } else {
-            ctx.pending_frame = new_frame;
-            ctx.frame_ready.store(true, .release);
-        }
+    if (!ring.tryPush(data_ptr[0..data_len], is_keyframe)) {
+        // Decoder is behind or packet too large — ask host for an IDR so we
+        // can resync once the consumer catches up.
+        return c.IHS_StreamVideoSubmitReportLost;
     }
     return c.IHS_StreamVideoSubmitOK;
+}
+
+fn videoDecodeThread(ctx: *DecodeCtx) void {
+    const codec_ctx = ctx.video_codec_ctx orelse return;
+    const av_frame = ctx.av_frame orelse return;
+    const yuv_frame = ctx.av_yuv_frame orelse return;
+    const ring = if (ctx.video_ring) |*r| r else return;
+
+    const scratch = ctx.allocator.alloc(u8, SLOT_CAP) catch return;
+    defer ctx.allocator.free(scratch);
+
+    while (true) {
+        var is_keyframe: bool = false;
+        const n = ring.pop(scratch, &is_keyframe) orelse return;
+
+        const pkt = c.av_packet_alloc() orelse continue;
+        defer c.av_packet_free(@ptrCast(@constCast(&pkt)));
+        if (c.av_new_packet(pkt, @intCast(n)) < 0) continue;
+        @memcpy(pkt.*.data[0..n], scratch[0..n]);
+
+        if (c.avcodec_send_packet(codec_ctx, pkt) < 0) continue;
+
+        while (c.avcodec_receive_frame(codec_ctx, av_frame) == 0) {
+            defer c.av_frame_unref(av_frame);
+
+            const w = av_frame.width;
+            const h = av_frame.height;
+
+            const sws = c.sws_getCachedContext(
+                ctx.video_sws_ctx,
+                w,
+                h,
+                av_frame.format,
+                w,
+                h,
+                c.AV_PIX_FMT_YUV420P,
+                c.SWS_BILINEAR,
+                null,
+                null,
+                null,
+            );
+            ctx.video_sws_ctx = sws;
+            if (sws == null) continue;
+
+            yuv_frame.width = w;
+            yuv_frame.height = h;
+            yuv_frame.format = c.AV_PIX_FMT_YUV420P;
+            if (c.av_frame_get_buffer(yuv_frame, 1) < 0) continue;
+            _ = c.sws_scale(sws, @ptrCast(&av_frame.data), @ptrCast(&av_frame.linesize), 0, h, @ptrCast(&yuv_frame.data), @ptrCast(&yuv_frame.linesize));
+
+            const y_sz: usize = @intCast(yuv_frame.linesize[0] * h);
+            const u_sz: usize = @intCast(yuv_frame.linesize[1] * @divTrunc(h, 2));
+            const v_sz: usize = @intCast(yuv_frame.linesize[2] * @divTrunc(h, 2));
+
+            const plane_y = ctx.allocator.alloc(u8, y_sz) catch {
+                c.av_frame_unref(yuv_frame);
+                continue;
+            };
+            const plane_u = ctx.allocator.alloc(u8, u_sz) catch {
+                ctx.allocator.free(plane_y);
+                c.av_frame_unref(yuv_frame);
+                continue;
+            };
+            const plane_v = ctx.allocator.alloc(u8, v_sz) catch {
+                ctx.allocator.free(plane_y);
+                ctx.allocator.free(plane_u);
+                c.av_frame_unref(yuv_frame);
+                continue;
+            };
+
+            const new_frame = VideoFrame{
+                .y = plane_y,
+                .u = plane_u,
+                .v = plane_v,
+                .width = @intCast(w),
+                .height = @intCast(h),
+                .y_stride = yuv_frame.linesize[0],
+                .u_stride = yuv_frame.linesize[1],
+                .v_stride = yuv_frame.linesize[2],
+                .allocator = ctx.allocator,
+            };
+
+            @memcpy(new_frame.y, yuv_frame.data[0][0..y_sz]);
+            @memcpy(new_frame.u, yuv_frame.data[1][0..u_sz]);
+            @memcpy(new_frame.v, yuv_frame.data[2][0..v_sz]);
+            c.av_frame_unref(yuv_frame);
+
+            if (ctx.frame_ready.load(.acquire)) {
+                ctx.allocator.free(new_frame.y);
+                ctx.allocator.free(new_frame.u);
+                ctx.allocator.free(new_frame.v);
+            } else {
+                ctx.pending_frame = new_frame;
+                ctx.frame_ready.store(true, .release);
+            }
+        }
+    }
 }
 
 fn videoStop(
@@ -232,6 +383,19 @@ fn videoStop(
 ) callconv(.c) void {
     _ = session;
     const ctx: *DecodeCtx = @ptrCast(@alignCast(ctx_ptr.?));
+
+    // Stop the producer→consumer hand-off first so the decode thread can
+    // exit before we free the codec context out from under it.
+    if (ctx.video_ring) |*r| r.requestStop();
+    if (ctx.video_thread) |t| {
+        t.join();
+        ctx.video_thread = null;
+    }
+    if (ctx.video_ring) |*r| {
+        r.deinit();
+        ctx.video_ring = null;
+    }
+
     if (ctx.av_yuv_frame) |f| {
         c.av_frame_free(@ptrCast(@constCast(&f)));
         ctx.av_yuv_frame = null;
@@ -272,7 +436,7 @@ fn audioStart(
     const codec = c.avcodec_find_decoder(codec_id) orelse return -1;
     const codec_ctx = c.avcodec_alloc_context3(codec) orelse return -1;
     codec_ctx.*.sample_rate = @intCast(cfg.frequency);
-    codec_ctx.*.ch_layout.nb_channels = @intCast(cfg.channels);
+    c.av_channel_layout_default(&codec_ctx.*.ch_layout, @intCast(cfg.channels));
 
     if (cfg.codecDataLen > 0 and cfg.codecData != null) {
         codec_ctx.*.extradata = @ptrCast(c.av_malloc(cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE));
@@ -307,8 +471,12 @@ fn audioStart(
     // Resample to stereo S16 if needed
     const swr = c.swr_alloc();
     if (swr == null) return 0; // audio decode still works, just won't resample
-    _ = c.av_opt_set_int(swr, "in_channel_count", @intCast(cfg.channels), 0);
-    _ = c.av_opt_set_int(swr, "out_channel_count", 2, 0);
+    var in_layout: c.AVChannelLayout = undefined;
+    var out_layout: c.AVChannelLayout = undefined;
+    c.av_channel_layout_default(&in_layout, @intCast(cfg.channels));
+    c.av_channel_layout_default(&out_layout, 2);
+    _ = c.av_opt_set_chlayout(swr, "in_chlayout", &in_layout, 0);
+    _ = c.av_opt_set_chlayout(swr, "out_chlayout", &out_layout, 0);
     _ = c.av_opt_set_int(swr, "in_sample_rate", @intCast(cfg.frequency), 0);
     _ = c.av_opt_set_int(swr, "out_sample_rate", @intCast(cfg.frequency), 0);
     _ = c.av_opt_set_sample_fmt(swr, "in_sample_fmt", codec_ctx.*.sample_fmt, 0);

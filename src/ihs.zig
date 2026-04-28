@@ -161,7 +161,6 @@ fn authThread(args: AuthArgs) void {
         args.ctx.done.store(true, .release);
         return;
     };
-    c.IHS_ClientSetDiscoveryCallbacks(client, &discovery_callbacks, null);
     c.IHS_ClientSetAuthorizationCallbacks(client, &auth_callbacks, args.ctx);
     _ = c.IHS_ClientStartDiscovery(client, 0);
     // Wait until we find the host, then request auth. The discovery callback
@@ -205,6 +204,7 @@ const StreamArgs = struct {
     ctx: *StreamRequestCtx,
     cfg: c.IHS_ClientConfig,
     host: c.IHS_HostInfo,
+    pin: [16]u8,
     width: i32,
     height: i32,
 };
@@ -266,6 +266,7 @@ fn streamRequestThread(args: StreamArgs) void {
     c.IHS_ClientSetStreamingCallbacks(client, &stream_callbacks, args.ctx);
 
     var req = std.mem.zeroes(c.IHS_StreamingRequest);
+    @memcpy(&req.pin, &args.pin);
     req.streamingEnable.video = true;
     req.streamingEnable.audio = true;
     req.streamingEnable.input = true;
@@ -290,9 +291,10 @@ pub fn startStreamRequest(
     ctx: *StreamRequestCtx,
     cfg: c.IHS_ClientConfig,
     host: c.IHS_HostInfo,
+    pin: [16]u8,
     width: i32,
     height: i32,
 ) !std.Thread {
-    const args = StreamArgs{ .ctx = ctx, .cfg = cfg, .host = host, .width = width, .height = height };
+    const args = StreamArgs{ .ctx = ctx, .cfg = cfg, .host = host, .pin = pin, .width = width, .height = height };
     return std.Thread.spawn(.{}, streamRequestThread, .{args});
 }

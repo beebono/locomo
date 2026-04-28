@@ -84,14 +84,16 @@ fn saveDeviceConfig(allocator: std.mem.Allocator, file_path: []const u8, cfg: De
         .device_name = cfg.device_name[0..name_len],
     };
     var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    var buf_writer = std.Io.Writer.fromArrayList(&buf);
-    var sj: std.json.Stringify = .{ .writer = &buf_writer, .options = .{} };
+    var buf_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    defer buf_writer.deinit();
+    var sj: std.json.Stringify = .{ .writer = &buf_writer.writer, .options = .{} };
     try sj.write(j);
+    var result = buf_writer.toArrayList();
+    defer result.deinit(allocator);
 
     const file = try Io.Dir.createFileAbsolute(io, file_path, .{});
     defer file.close(io);
-    try file.writeStreamingAll(io, buf.items);
+    try file.writeStreamingAll(io, result.items);
 }
 
 fn fromDeviceJson(j: DeviceJson) DeviceConfig {
@@ -134,14 +136,16 @@ pub fn savePaired(allocator: std.mem.Allocator, host: PairedHost) !void {
         .steam_id = host.steam_id,
     };
     var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    var buf_writer = std.Io.Writer.fromArrayList(&buf);
-    var sj: std.json.Stringify = .{ .writer = &buf_writer, .options = .{} };
+    var buf_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    defer buf_writer.deinit();
+    var sj: std.json.Stringify = .{ .writer = &buf_writer.writer, .options = .{} };
     try sj.write(j);
+    var result = buf_writer.toArrayList();
+    defer result.deinit(allocator);
 
     const file = try Io.Dir.createFileAbsolute(io, file_path, .{});
     defer file.close(io);
-    try file.writeStreamingAll(io, buf.items);
+    try file.writeStreamingAll(io, result.items);
 }
 
 fn fromPairedJson(j: PairedJson) PairedHost {
@@ -178,12 +182,14 @@ pub fn saveSettings(allocator: std.mem.Allocator, s: Settings) !void {
     defer allocator.free(file_path);
 
     var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    var buf_writer = std.Io.Writer.fromArrayList(&buf);
-    var sj: std.json.Stringify = .{ .writer = &buf_writer, .options = .{} };
+    var buf_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    defer buf_writer.deinit();
+    var sj: std.json.Stringify = .{ .writer = &buf_writer.writer, .options = .{} };
     try sj.write(s);
 
     const file = try Io.Dir.createFileAbsolute(io, file_path, .{});
     defer file.close(io);
-    try file.writeStreamingAll(io, buf.items);
+    var result = buf_writer.toArrayList();
+    defer result.deinit(allocator);
+    try file.writeStreamingAll(io, result.items);
 }

@@ -20,8 +20,35 @@ const Phase = enum {
 
 const SessionCtx = struct {
     disconnected: std.atomic.Value(bool),
+    connected: std.atomic.Value(bool),
     enable_hevc: bool,
 };
+
+fn onSessionConnected(
+    session: ?*c.IHS_Session,
+    ctx_ptr: ?*anyopaque,
+) callconv(.c) void {
+    _ = session;
+    const ctx: *SessionCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    ctx.connected.store(true, .release);
+}
+
+fn logPrint(
+    level: c.IHS_LogLevel,
+    tag: [*c]const u8,
+    message: [*c]const u8,
+) callconv(.c) void {
+    // IHS log levels are listed backwards in the enum
+    // so anything greater than Info is more verbose
+    // rather than less, ignore them to reduce noise
+    if (level > c.IHS_LogLevelInfo) return;
+    const level_name = c.IHS_LogLevelName(level);
+    std.debug.print("[IHS.{s} {s}] {s}\n", .{
+        std.mem.span(tag),
+        std.mem.span(level_name),
+        std.mem.span(message),
+    });
+}
 
 fn onSessionDisconnected(
     session: ?*c.IHS_Session,
@@ -48,7 +75,7 @@ var session_callbacks = c.IHS_StreamSessionCallbacks{
     .initialized = null,
     .connecting = null,
     .configuring = onSessionConfiguring,
-    .connected = null,
+    .connected = onSessionConnected,
     .disconnected = onSessionDisconnected,
     .finalized = null,
 };
@@ -237,92 +264,60 @@ fn reconnectPrompt(state: *AppState) void {
 
 fn pairWithPin(state: *AppState) !void {
     const host = state.selected_host orelse return error.NoHost;
-    var attempts: u8 = 0;
 
-    while (attempts < 3) : (attempts += 1) {
-        state.ui.resetPin();
+    var rng = std.Random.DefaultPrng.init(@as(u64, @bitCast(std.Io.Clock.real.now(io).toMilliseconds())));
+    var pin: [4]u8 = undefined;
+    for (&pin) |*d| d.* = '0' + @as(u8, @intCast(rng.random().intRangeLessThan(u8, 0, 10)));
 
-        // Collect PIN via padlock UI
-        var pin_collected = false;
-        var pin_buf: [5]u8 = undefined;
-        while (!pin_collected) {
-            state.ui.drawPinScreen();
-            switch (state.ui.pollEvents()) {
-                .quit => {
-                    state.phase = .quit;
-                    return;
-                },
-                .button_b => {
-                    state.phase = .scan;
-                    return;
-                },
-                .dpad_up => state.ui.pinAdjustDigit(1),
-                .dpad_down => state.ui.pinAdjustDigit(-1),
-                .dpad_left => state.ui.pinMoveSlot(-1),
-                .dpad_right => state.ui.pinMoveSlot(1),
-                .button_a => {
-                    state.ui.pinString(&pin_buf);
-                    pin_collected = true;
-                },
-                else => {},
-            }
-            io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+    state.ui.resetPin();
+    state.ui.pin_status = .waiting;
+
+    var auth_ctx = ihs.AuthCtx.init();
+    const cfg = state.clientConfig();
+    const auth_thread = try ihs.startAuthorize(&auth_ctx, cfg, host, &pin);
+
+    while (!auth_ctx.done.load(.acquire)) {
+        state.ui.drawPinDisplay(&pin);
+        const ev = state.ui.pollEvents();
+        if (ev == .quit) {
+            state.phase = .quit;
+            auth_thread.join();
+            return;
         }
-
-        state.ui.pin_status = .waiting;
-
-        // Kick off auth in background
-        var auth_ctx = ihs.AuthCtx.init();
-        const cfg = state.clientConfig();
-        const auth_thread = try ihs.startAuthorize(&auth_ctx, cfg, host, pin_buf[0..4]);
-
-        while (!auth_ctx.done.load(.acquire)) {
-            state.ui.drawPinScreen();
-            const ev = state.ui.pollEvents();
-            if (ev == .quit) {
-                state.phase = .quit;
-                auth_thread.join();
-                return;
-            }
-            if (ev == .button_b) {
-                state.phase = .scan;
-                auth_thread.join();
-                return;
-            }
-            io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+        if (ev == .button_b) {
+            state.phase = .scan;
+            auth_thread.join();
+            return;
         }
-        auth_thread.join();
-
-        switch (auth_ctx.result) {
-            .success => {
-                var paired_host = std.mem.zeroes(config.PairedHost);
-                @memcpy(paired_host.hostname[0..host.hostname.len], &host.hostname);
-                paired_host.client_id = host.clientId;
-                paired_host.instance_id = host.instanceId;
-                paired_host.steam_id = auth_ctx.steam_id;
-                state.paired = paired_host;
-                try config.savePaired(state.allocator, paired_host);
-                state.phase = .streaming;
-                return;
-            },
-            .denied => {
-                state.ui.pin_status = .denied;
-                state.ui.drawPinScreen();
-                io.sleep(.fromNanoseconds(1500 * std.time.ns_per_ms), .awake) catch {};
-                // retry
-            },
-            .failed => {
-                state.ui.pin_status = .failed;
-                state.ui.drawPinScreen();
-                io.sleep(.fromNanoseconds(1500 * std.time.ns_per_ms), .awake) catch {};
-                state.phase = .scan;
-                return;
-            },
-        }
+        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
     }
+    auth_thread.join();
 
-    // 3 denied attempts → back to scan
-    state.phase = .scan;
+    switch (auth_ctx.result) {
+        .success => {
+            var paired_host = std.mem.zeroes(config.PairedHost);
+            @memcpy(paired_host.hostname[0..host.hostname.len], &host.hostname);
+            paired_host.client_id = host.clientId;
+            paired_host.instance_id = host.instanceId;
+            paired_host.steam_id = auth_ctx.steam_id;
+            @memcpy(paired_host.pin[0..4], &pin);
+            state.paired = paired_host;
+            try config.savePaired(state.allocator, paired_host);
+            state.phase = .streaming;
+        },
+        .denied => {
+            state.ui.pin_status = .denied;
+            state.ui.drawPinDisplay(&pin);
+            io.sleep(.fromNanoseconds(1500 * std.time.ns_per_ms), .awake) catch {};
+            state.phase = .scan;
+        },
+        .failed => {
+            state.ui.pin_status = .failed;
+            state.ui.drawPinDisplay(&pin);
+            io.sleep(.fromNanoseconds(1500 * std.time.ns_per_ms), .awake) catch {};
+            state.phase = .scan;
+        },
+    }
 }
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
@@ -338,6 +333,7 @@ fn beginStreaming(state: *AppState) !void {
         &stream_ctx,
         cfg,
         host,
+        std.mem.zeroes([16]u8),
         @intCast(state.settings.width),
         @intCast(state.settings.height),
     );
@@ -362,20 +358,18 @@ fn beginStreaming(state: *AppState) !void {
         state.phase = .disconnected;
         return;
     };
+    c.IHS_SessionSetLogFunction(session, logPrint);
     defer c.IHS_SessionDestroy(session);
 
     // Set callbacks
     var sess_ctx = SessionCtx{
         .disconnected = std.atomic.Value(bool).init(false),
+        .connected = std.atomic.Value(bool).init(false),
         .enable_hevc = state.settings.enable_hevc,
     };
     c.IHS_SessionSetSessionCallbacks(session, &session_callbacks, &sess_ctx);
     c.IHS_SessionSetVideoCallbacks(session, &decode.video_callbacks, &state.decode_ctx);
     c.IHS_SessionSetAudioCallbacks(session, &decode.audio_callbacks, &state.decode_ctx);
-
-    // HID input passthrough
-    input.init(session);
-    defer input.deinit();
 
     state.ui.drawStatus("Connecting...");
     if (!c.IHS_SessionConnect(session)) {
@@ -384,6 +378,11 @@ fn beginStreaming(state: *AppState) !void {
         state.phase = .disconnected;
         return;
     }
+
+    // HID input passthrough, defer until connected or Host immediately
+    // refuses the connection thinking something went wrong.
+    var hid_initialized = false;
+    defer if (hid_initialized) input.deinit();
 
     // Create streaming texture (allocate lazily on first frame)
     var texture: ?*c.SDL_Texture = null;
@@ -394,6 +393,10 @@ fn beginStreaming(state: *AppState) !void {
     // Presentation loop
     var frame: decode.VideoFrame = undefined;
     while (!sess_ctx.disconnected.load(.acquire)) {
+        if (!hid_initialized and sess_ctx.connected.load(.acquire)) {
+            input.init(session);
+            hid_initialized = true;
+        }
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event) != 0) {
             if (event.type == c.SDL_QUIT) {

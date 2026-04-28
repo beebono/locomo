@@ -40,8 +40,6 @@ pub const Ui = struct {
     host_cursor: usize = 0,
 
     // PIN screen state
-    pin_digits: [4]u8 = .{ 0, 0, 0, 0 },
-    pin_slot: u8 = 0,
     pin_status: PinStatus = .idle,
 
     // Reconnect screen state
@@ -64,13 +62,19 @@ pub const Ui = struct {
             c.SDL_WINDOWPOS_CENTERED,
             WINDOW_W,
             WINDOW_H,
-            c.SDL_WINDOW_SHOWN,
+            c.SDL_WINDOW_SHOWN | c.SDL_WINDOW_FULLSCREEN_DESKTOP,
         ) orelse return error.CreateWindowFailed;
         errdefer c.SDL_DestroyWindow(window);
 
         const renderer = c.SDL_CreateRenderer(window, -1, c.SDL_RENDERER_ACCELERATED | c.SDL_RENDERER_PRESENTVSYNC) orelse
             return error.CreateRendererFailed;
         errdefer c.SDL_DestroyRenderer(renderer);
+        _ = c.SDL_RenderSetLogicalSize(renderer, WINDOW_W, WINDOW_H);
+
+        var ci: c_int = 0;
+        while (ci < c.SDL_NumJoysticks()) : (ci += 1) {
+            if (c.SDL_IsGameController(ci) != 0) _ = c.SDL_GameControllerOpen(ci);
+        }
 
         const font = c.TTF_OpenFont("assets/Asap-Medium.otf", FONT_SIZE) orelse return error.OpenFontFailed;
         errdefer c.TTF_CloseFont(font);
@@ -100,6 +104,9 @@ pub const Ui = struct {
         while (c.SDL_PollEvent(&event) != 0) {
             switch (event.type) {
                 c.SDL_QUIT => return .quit,
+                c.SDL_CONTROLLERDEVICEADDED => {
+                    _ = c.SDL_GameControllerOpen(event.cdevice.which);
+                },
                 c.SDL_CONTROLLERBUTTONDOWN => {
                     const btn = event.cbutton.button;
                     if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_UP) return .dpad_up;
@@ -212,7 +219,7 @@ pub const Ui = struct {
             self.renderText(label, 80, y, col, self.font);
         }
 
-        self.renderTextCentered("DPAD to navigate  \u{25B3}/A to connect  START for settings", WINDOW_H - 50, COLOR_DIM, self.font_small);
+        self.renderTextCentered("DPAD to navigate  A to connect  START for settings", WINDOW_H - 50, COLOR_DIM, self.font_small);
         self.present();
     }
 
@@ -226,76 +233,6 @@ pub const Ui = struct {
 
     pub fn selectedHostIndex(self: *const Ui) usize {
         return self.host_cursor;
-    }
-
-    // ── PIN screen ───────────────────────────────────────────────────────────
-
-    pub fn drawPinScreen(self: *Ui) void {
-        self.clear();
-        self.renderTextCentered("Enter Pairing PIN", 60, COLOR_FG, self.font);
-        self.renderTextCentered("Use DPAD: Up/Down = digit  Left/Right = slot  A = confirm  B = cancel", 110, COLOR_DIM, self.font_small);
-
-        const slot_w: i32 = 90;
-        const slot_h: i32 = 110;
-        const gap: i32 = 20;
-        const total_w = 4 * slot_w + 3 * gap;
-        const start_x = @divTrunc(WINDOW_W - total_w, 2);
-        const slot_y: i32 = 200;
-
-        for (self.pin_digits, 0..) |digit, i| {
-            const x = start_x + @as(i32, @intCast(i)) * (slot_w + gap);
-            const is_active = (i == self.pin_slot);
-            const outline_col = if (is_active) COLOR_SEL else COLOR_DIM;
-            const bg_col: c.SDL_Color = if (is_active) .{ .r = 20, .g = 40, .b = 80, .a = 255 } else .{ .r = 20, .g = 20, .b = 40, .a = 255 };
-
-            self.drawRect(x, slot_y, slot_w, slot_h, bg_col);
-            self.drawRectOutline(x, slot_y, slot_w, slot_h, outline_col);
-
-            var dbuf: [4]u8 = undefined;
-            const dstr = std.fmt.bufPrintZ(&dbuf, "{d}", .{digit}) catch continue;
-            const surf = c.TTF_RenderUTF8_Blended(self.font, dstr.ptr, COLOR_FG) orelse continue;
-            defer c.SDL_FreeSurface(surf);
-            const tex = c.SDL_CreateTextureFromSurface(self.renderer, surf) orelse continue;
-            defer c.SDL_DestroyTexture(tex);
-            var tw: i32 = 0;
-            var th: i32 = 0;
-            _ = c.SDL_QueryTexture(tex, null, null, &tw, &th);
-            const cx = x + @divTrunc(slot_w - tw, 2);
-            const cy = slot_y + @divTrunc(slot_h - th, 2);
-            const dst = c.SDL_Rect{ .x = cx, .y = cy, .w = tw, .h = th };
-            _ = c.SDL_RenderCopy(self.renderer, tex, null, &dst);
-        }
-
-        const status_y: i32 = 360;
-        switch (self.pin_status) {
-            .idle => {},
-            .waiting => self.renderTextCentered("Waiting for host to confirm...", status_y, COLOR_DIM, self.font_small),
-            .denied => self.renderTextCentered("PIN denied. Try again.", status_y, COLOR_ERR, self.font_small),
-            .failed => self.renderTextCentered("Pairing failed.", status_y, COLOR_ERR, self.font_small),
-        }
-
-        self.present();
-    }
-
-    pub fn pinAdjustDigit(self: *Ui, delta: i32) void {
-        const d: i32 = @intCast(self.pin_digits[self.pin_slot]);
-        self.pin_digits[self.pin_slot] = @intCast(@mod(d + delta + 10, 10));
-    }
-
-    pub fn pinMoveSlot(self: *Ui, delta: i32) void {
-        const s: i32 = @intCast(self.pin_slot);
-        self.pin_slot = @intCast(@mod(s + delta + 4, 4));
-    }
-
-    pub fn pinString(self: *const Ui, buf: *[5]u8) void {
-        for (self.pin_digits, 0..) |d, i| buf[i] = '0' + d;
-        buf[4] = 0;
-    }
-
-    pub fn resetPin(self: *Ui) void {
-        self.pin_digits = .{ 0, 0, 0, 0 };
-        self.pin_slot = 0;
-        self.pin_status = .idle;
     }
 
     // ── Status screen ────────────────────────────────────────────────────────
@@ -334,10 +271,8 @@ pub const Ui = struct {
 
         self.drawRectOutline(bx, by, btn_w, btn_h, yes_col);
         self.renderText("Reconnect", bx + 30, by + 15, yes_col, self.font);
-
         self.drawRectOutline(bx + btn_w + gap, by, btn_w, btn_h, new_col);
         self.renderText("New Pair", bx + btn_w + gap + 30, by + 15, new_col, self.font);
-
         self.renderTextCentered("DPAD Left/Right to choose  A to confirm", WINDOW_H - 50, COLOR_DIM, self.font_small);
     }
 
@@ -346,6 +281,51 @@ pub const Ui = struct {
             .reconnect => .new_pair,
             .new_pair => .reconnect,
         };
+    }
+
+    // ── PIN screen ───────────────────────────────────────────────────────────
+
+    pub fn resetPin(self: *Ui) void {
+        self.pin_status = .idle;
+    }
+
+    pub fn drawPinDisplay(self: *Ui, pin: *const [4]u8) void {
+        self.clear();
+        self.renderTextCentered("Pairing — enter this PIN on your PC", 60, COLOR_FG, self.font);
+        self.renderTextCentered("Type the PIN shown below into Steam, then wait.", 110, COLOR_DIM, self.font_small);
+
+        const slot_w: i32 = 90;
+        const slot_h: i32 = 110;
+        const gap: i32 = 20;
+        const total_w = 4 * slot_w + 3 * gap;
+        const start_x = @divTrunc(WINDOW_W - total_w, 2);
+        const slot_y: i32 = 200;
+
+        for (pin, 0..) |digit, i| {
+            const x = start_x + @as(i32, @intCast(i)) * (slot_w + gap);
+            self.drawRect(x, slot_y, slot_w, slot_h, .{ .r = 20, .g = 40, .b = 80, .a = 255 });
+            self.drawRectOutline(x, slot_y, slot_w, slot_h, COLOR_SEL);
+            var dbuf: [4]u8 = undefined;
+            const dstr = std.fmt.bufPrintZ(&dbuf, "{c}", .{digit}) catch continue;
+            const surf = c.TTF_RenderUTF8_Blended(self.font, dstr.ptr, COLOR_FG) orelse continue;
+            defer c.SDL_FreeSurface(surf);
+            const tex = c.SDL_CreateTextureFromSurface(self.renderer, surf) orelse continue;
+            defer c.SDL_DestroyTexture(tex);
+            var tw: i32 = 0;
+            var th: i32 = 0;
+            _ = c.SDL_QueryTexture(tex, null, null, &tw, &th);
+            const cx = x + @divTrunc(slot_w - tw, 2);
+            const cy = slot_y + @divTrunc(slot_h - th, 2);
+            _ = c.SDL_RenderCopy(self.renderer, tex, null, &c.SDL_Rect{ .x = cx, .y = cy, .w = tw, .h = th });
+        }
+
+        const status_y: i32 = 360;
+        switch (self.pin_status) {
+            .idle, .waiting => self.renderTextCentered("Waiting for PC confirmation...  B = cancel", status_y, COLOR_DIM, self.font_small),
+            .denied => self.renderTextCentered("PIN denied.", status_y, COLOR_ERR, self.font_small),
+            .failed => self.renderTextCentered("Pairing failed.", status_y, COLOR_ERR, self.font_small),
+        }
+        self.present();
     }
 
     // ── Settings screen ──────────────────────────────────────────────────────
@@ -403,9 +383,18 @@ pub const Ui = struct {
                 var ri: i32 = @intCast(resIndex(s.width, s.height));
                 ri = @mod(ri + delta + 3, 3);
                 switch (ri) {
-                    0 => { s.width = 1280; s.height = 720; },
-                    1 => { s.width = 1920; s.height = 1080; },
-                    2 => { s.width = 2560; s.height = 1440; },
+                    0 => {
+                        s.width = 1280;
+                        s.height = 720;
+                    },
+                    1 => {
+                        s.width = 1920;
+                        s.height = 1080;
+                    },
+                    2 => {
+                        s.width = 2560;
+                        s.height = 1440;
+                    },
                     else => {},
                 }
             },
