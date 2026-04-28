@@ -17,4 +17,4 @@ docker run --rm \
     -e "ZIG_GLOBAL_CACHE_DIR=/work/.zig-cache" \
     -u "$(id -u):$(id -g)" \
     "$IMAGE" \
-    bash -c "scripts/bootstrap.sh && zig build $ZIG_TARGET"
+    bash -c "scripts/bootstrap.sh && zig build $ZIG_TARGET -Doptimize=ReleaseFast"
