@@ -300,7 +300,6 @@ fn pairWithPin(state: *AppState) !void {
             paired_host.client_id = host.clientId;
             paired_host.instance_id = host.instanceId;
             paired_host.steam_id = auth_ctx.steam_id;
-            @memcpy(paired_host.pin[0..4], &pin);
             state.paired = paired_host;
             try config.savePaired(state.allocator, paired_host);
             state.phase = .streaming;
