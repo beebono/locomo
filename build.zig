@@ -83,13 +83,17 @@ pub fn build(b: *std.Build) void {
 
     const mod = exe.root_module;
 
+    // Multiarch/Cross handling
+    if (target.result.cpu.arch == .aarch64) {
+        mod.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+    }
+
     // Includes
     mod.addIncludePath(b.path("external/ihslib/include"));
     mod.addIncludePath(b.path("external/ihslib/src"));
     mod.addIncludePath(b.path("external/ihslib/src/hid/sdl/include"));
     mod.addIncludePath(b.path("external/ihslib/src/hid/sdl/src"));
     mod.addIncludePath(b.path("libs/include"));
-    // ihslib/src/platforms/ihs_thread_sdl.c uses bare <SDL.h>
     mod.addIncludePath(b.path("libs/include/SDL2"));
 
     // ihslib pre-compilation
@@ -98,19 +102,19 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=gnu11", "-DIHS_CRYPTO_MBEDTLS" },
     });
 
-    // Bootstrap built static libraries
-    mod.addObjectFile(b.path("libs/lib/libfreetype.a"));
-    mod.addObjectFile(b.path("libs/lib/libSDL2.a"));
-    mod.addObjectFile(b.path("libs/lib/libSDL2_ttf.a"));
+    // Bootstrap built libraries
+    mod.addObjectFile(b.path("libs/lib/libSDL2.so"));
+    mod.addObjectFile(b.path("libs/lib/libSDL2_ttf.so"));
     mod.addObjectFile(b.path("libs/lib/libavcodec.a"));
     mod.addObjectFile(b.path("libs/lib/libavformat.a"));
     mod.addObjectFile(b.path("libs/lib/libavutil.a"));
     mod.addObjectFile(b.path("libs/lib/libswresample.a"));
     mod.addObjectFile(b.path("libs/lib/libswscale.a"));
-
-    // Bootstrap built static libraries (crypto + protobuf)
     mod.addObjectFile(b.path("libs/lib/libmbedcrypto.a"));
     mod.addObjectFile(b.path("libs/lib/libprotobuf-c.a"));
+
+    // System libraries
+    mod.linkSystemLibrary("drm", .{});
     mod.linkSystemLibrary("m", .{});
     mod.linkSystemLibrary("dl", .{});
     mod.linkSystemLibrary("pthread", .{});

@@ -39,7 +39,12 @@ cmake_cross_flags() {
         local cpu="${TARGET%%-*}"
         echo "-DCMAKE_SYSTEM_NAME=$system -DCMAKE_SYSTEM_PROCESSOR=$cpu \
               -DCMAKE_C_COMPILER=${TARGET}-gcc \
-              -DCMAKE_CXX_COMPILER=${TARGET}-g++"
+              -DCMAKE_CXX_COMPILER=${TARGET}-g++ \
+              -DCMAKE_FIND_ROOT_PATH=/usr/lib/${TARGET} \
+              -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+              -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+              -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+              -DPKG_CONFIG_EXECUTABLE=/usr/local/bin/${TARGET}-pkg-config"
     fi
 }
 
@@ -56,14 +61,16 @@ build_sdl2() {
 
     mkdir -p "$build"
 
+    # Point pkg-config at the target sysroot .pc files when cross-compiling
+    local pkg_config_env=()
+    if [ -n "$TARGET" ]; then
+        pkg_config_env=(env PKG_CONFIG_LIBDIR="/usr/lib/${TARGET}/pkgconfig:/usr/share/pkgconfig")
+    fi
+
     # shellcheck disable=SC2046
-    cmake -S "$src" -B "$build" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
-        -DBUILD_SHARED_LIBS=OFF \
-        -DSDL_STATIC=ON \
-        -DSDL_SHARED=OFF \
-        -DSDL_TEST=OFF \
+    "${pkg_config_env[@]}" cmake -S "$src" -B "$build" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
+        -DSDL_STATIC=OFF -DSDL_SHARED=ON -DSDL_TEST=OFF -DSDL_RPATH=OFF \
         $(cmake_cross_flags)
 
     cmake --build "$build" --parallel "$JOBS"
@@ -87,12 +94,8 @@ build_sdl2_ttf() {
 
     # shellcheck disable=SC2046
     cmake -S "$src" -B "$build" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
-        -DBUILD_SHARED_LIBS=OFF \
-        -DSDL2TTF_SAMPLES=OFF \
-        -DSDL2TTF_INSTALL=ON \
-        -DSDL2TTF_VENDORED=ON \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
+        -DSDL2TTF_SAMPLES=OFF -DSDL2TTF_INSTALL=ON -DSDL2TTF_VENDORED=ON \
         -DSDL2_DIR="$LIBS_DIR/lib/cmake/SDL2" \
         $(cmake_cross_flags)
 
@@ -126,12 +129,9 @@ build_mbedtls() {
 
     # shellcheck disable=SC2046
     cmake -S "$src" -B "$build" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
-        -DENABLE_TESTING=OFF \
-        -DENABLE_PROGRAMS=OFF \
-        -DUSE_SHARED_MBEDTLS_LIBRARY=OFF \
-        -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
+        -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+        -DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
         $(cmake_cross_flags)
 
     cmake --build "$build" --parallel "$JOBS"
