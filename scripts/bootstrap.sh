@@ -1,20 +1,17 @@
 #!/usr/bin/bash
+# Required library prebuild bootstrap script
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIBS_DIR="$REPO_ROOT/libs"
 BUILD_DIR="$REPO_ROOT/.bootstrap-build"
-JOBS="${JOBS:-$(nproc)}"
-TARGET="${TARGET:-}"
+JOBS=$(nproc)
 
 mkdir -p "$LIBS_DIR/lib" "$LIBS_DIR/include" "$BUILD_DIR"
 
 echo "==> Bootstrap: output to $LIBS_DIR"
 [ -n "$TARGET" ] && echo "    Cross-compile target: $TARGET"
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 check_deps() {
     local missing=()
@@ -28,12 +25,10 @@ check_deps() {
 }
 
 cross_flags() {
-    # Emit --host flag for autoconf-based builds when cross-compiling
     [ -n "$TARGET" ] && echo "--host=$TARGET" || true
 }
 
 cmake_cross_flags() {
-    # Emit CMAKE_TOOLCHAIN_FILE or system name flags when cross-compiling
     if [ -n "$TARGET" ]; then
         local system="Linux"
         local cpu="${TARGET%%-*}"
@@ -48,10 +43,6 @@ cmake_cross_flags() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# SDL2
-# ---------------------------------------------------------------------------
-
 build_sdl2() {
     echo ""
     echo "==> Building SDL2..."
@@ -61,7 +52,6 @@ build_sdl2() {
 
     mkdir -p "$build"
 
-    # Point pkg-config at the target sysroot .pc files when cross-compiling
     local pkg_config_env=()
     if [ -n "$TARGET" ]; then
         pkg_config_env=(env PKG_CONFIG_LIBDIR="/usr/lib/${TARGET}/pkgconfig:/usr/share/pkgconfig")
@@ -78,10 +68,6 @@ build_sdl2() {
 
     echo "    SDL2 done."
 }
-
-# ---------------------------------------------------------------------------
-# SDL2_ttf
-# ---------------------------------------------------------------------------
 
 build_sdl2_ttf() {
     echo ""
@@ -104,10 +90,6 @@ build_sdl2_ttf() {
 
     echo "    SDL2_ttf done."
 }
-
-# ---------------------------------------------------------------------------
-# mbedTLS (provides libmbedcrypto)
-# ---------------------------------------------------------------------------
 
 build_mbedtls() {
     echo ""
@@ -140,10 +122,6 @@ build_mbedtls() {
     echo "    mbedTLS done."
 }
 
-# ---------------------------------------------------------------------------
-# protobuf-c
-# ---------------------------------------------------------------------------
-
 build_protobuf_c() {
     echo ""
     echo "==> Building protobuf-c..."
@@ -162,7 +140,6 @@ build_protobuf_c() {
 
     cd "$src"
 
-    # protobuf-c configure needs protoc on PATH; it's in the container
     # shellcheck disable=SC2046
     ./configure \
         --prefix="$LIBS_DIR" \
@@ -177,10 +154,6 @@ build_protobuf_c() {
 
     echo "    protobuf-c done."
 }
-
-# ---------------------------------------------------------------------------
-# FFmpeg
-# ---------------------------------------------------------------------------
 
 build_ffmpeg() {
     echo ""
@@ -203,35 +176,21 @@ build_ffmpeg() {
     fi
 
     "$src/configure" \
-        --prefix="$LIBS_DIR" \
-        --enable-static \
-        --disable-shared \
+        --prefix="$LIBS_DIR" --bindir="$BUILD_DIR/ffmpeg-bin" \
+        --enable-static --disable-shared \
         --disable-everything \
-        --enable-protocol=rtp \
-        --enable-protocol=udp \
-        --enable-protocol=tcp \
-        --enable-demuxer=rtsp \
-        --enable-demuxer=rtp \
-        --enable-demuxer=h264 \
-        --enable-demuxer=hevc \
-        --enable-parser=h264 \
-        --enable-parser=hevc \
-        --enable-parser=aac \
-        --enable-parser=opus \
-        --enable-decoder=h264 \
-        --enable-decoder=hevc \
-        --enable-decoder=aac \
-        --enable-decoder=opus \
+        --enable-protocol=rtp --enable-protocol=udp --enable-protocol=tcp \
+        --enable-demuxer=rtsp --enable-demuxer=rtp \
+        --enable-demuxer=h264 --enable-demuxer=hevc \
+        --enable-parser=h264 --enable-parser=hevc \
+        --enable-parser=aac --enable-parser=opus \
+        --enable-decoder=h264 --enable-decoder=hevc \
+        --enable-decoder=aac --enable-decoder=opus \
         --enable-v4l2-m2m \
-        --disable-avdevice \
-        --disable-avfilter \
-        --disable-doc \
-        --disable-programs \
-        --enable-pic \
-        --enable-optimizations \
-        --extra-cflags="-I$LIBS_DIR/include" \
-        --extra-ldflags="-L$LIBS_DIR/lib" \
-        --bindir="$BUILD_DIR/ffmpeg-bin" \
+        --disable-avdevice --disable-avfilter \
+        --disable-doc --disable-programs \
+        --enable-pic --enable-optimizations \
+        --extra-cflags="-I$LIBS_DIR/include" --extra-ldflags="-L$LIBS_DIR/lib" \
         "${cross_prefix_flags[@]+"${cross_prefix_flags[@]}"}"
 
     make -j"$JOBS"
@@ -239,10 +198,6 @@ build_ffmpeg() {
 
     echo "    FFmpeg done."
 }
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 check_deps
 build_sdl2
@@ -252,5 +207,4 @@ build_protobuf_c
 build_ffmpeg
 
 echo ""
-echo "==> Bootstrap complete. Libraries installed to $LIBS_DIR"
-echo "    Run: zig build"
+echo "==> Bootstrap complete. Libraries placed in $LIBS_DIR"

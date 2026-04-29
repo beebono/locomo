@@ -120,7 +120,11 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("pthread", .{});
     mod.link_libc = true;
 
-    b.installArtifact(exe);
+    b.installFile("assets/Asap-Medium.otf", "bin/assets/Asap-Medium.otf");
+    b.installFile("libs/lib/libSDL2-2.0.so.0", "bin/lib/libSDL2-2.0.so.0");
+    b.installFile("libs/lib/libSDL2_ttf-2.0.so.0", "bin/lib/libSDL2_ttf-2.0.so.0");
+    b.installFile("scripts/launcher/locomo.sh", "bin/locomo.sh");
+    const install_step = b.addInstallArtifact(exe, .{});
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -138,4 +142,11 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    const msg = b.addSystemCommand(&.{
+        "echo",
+        "Build complete! Files are under ./zig-out/bin/",
+    });
+    msg.step.dependOn(&install_step.step);
+    b.getInstallStep().dependOn(&msg.step);
 }
