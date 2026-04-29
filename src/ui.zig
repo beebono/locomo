@@ -2,10 +2,8 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const config = @import("config.zig");
 
-const WINDOW_W = 1280;
-const WINDOW_H = 720;
-const FONT_SIZE = 28;
-const FONT_SMALL = 20;
+const FONT_SIZE = 64;
+const FONT_SMALL = 48;
 
 const COLOR_BG = c.SDL_Color{ .r = 15, .g = 15, .b = 30, .a = 255 };
 const COLOR_FG = c.SDL_Color{ .r = 220, .g = 220, .b = 220, .a = 255 };
@@ -27,19 +25,19 @@ pub const UiEvent = enum {
 };
 
 pub const PinStatus = enum { idle, waiting, denied, failed };
-pub const ReconnectChoice = enum { reconnect, new_pair };
 pub const ResOption = enum { r720, r1080, r1440 };
 
 pub const Ui = struct {
     window: *c.SDL_Window,
     renderer: *c.SDL_Renderer,
+    logical_w: c_int = 1280,
+    logical_h: c_int = 720,
     font: *c.TTF_Font,
     font_small: *c.TTF_Font,
 
     // Tracked screen states
     host_cursor: usize = 0,
     pin_status: PinStatus = .idle,
-    reconnect_choice: ReconnectChoice = .reconnect,
     settings_row: u8 = 0,
 
     pub fn init() !Ui {
@@ -50,20 +48,26 @@ pub const Ui = struct {
         if (c.TTF_Init() != 0) return error.TTFInitFailed;
         errdefer c.TTF_Quit();
 
+        var dm: c.SDL_DisplayMode = undefined;
+        const display_idx: c_int = 0;
+        const have_dm = c.SDL_GetCurrentDisplayMode(display_idx, &dm) == 0;
+        const screen_w: c_int = if (have_dm) dm.w else 1280;
+        const screen_h: c_int = if (have_dm) dm.h else 720;
+
         const window = c.SDL_CreateWindow(
             "Locomo",
             c.SDL_WINDOWPOS_CENTERED,
             c.SDL_WINDOWPOS_CENTERED,
-            WINDOW_W,
-            WINDOW_H,
+            screen_w,
+            screen_h,
             c.SDL_WINDOW_SHOWN | c.SDL_WINDOW_FULLSCREEN_DESKTOP,
         ) orelse return error.CreateWindowFailed;
         errdefer c.SDL_DestroyWindow(window);
 
-        const renderer = c.SDL_CreateRenderer(window, -1, c.SDL_RENDERER_ACCELERATED | c.SDL_RENDERER_PRESENTVSYNC) orelse
+        const renderer = c.SDL_CreateRenderer(window, -1, c.SDL_RENDERER_ACCELERATED) orelse
             return error.CreateRendererFailed;
         errdefer c.SDL_DestroyRenderer(renderer);
-        _ = c.SDL_RenderSetLogicalSize(renderer, WINDOW_W, WINDOW_H);
+        _ = c.SDL_RenderSetLogicalSize(renderer, screen_w, screen_h);
 
         var ci: c_int = 0;
         while (ci < c.SDL_NumJoysticks()) : (ci += 1) {
@@ -78,6 +82,8 @@ pub const Ui = struct {
         return Ui{
             .window = window,
             .renderer = renderer,
+            .logical_w = screen_w,
+            .logical_h = screen_h,
             .font = font,
             .font_small = font_small,
         };
@@ -156,7 +162,7 @@ pub const Ui = struct {
         var w: i32 = 0;
         var h: i32 = 0;
         _ = c.SDL_QueryTexture(tex, null, null, &w, &h);
-        const x = @divTrunc(WINDOW_W - w, 2);
+        const x = @divTrunc(self.logical_w - w, 2);
         const dst = c.SDL_Rect{ .x = x, .y = y, .w = w, .h = h };
         _ = c.SDL_RenderCopy(self.renderer, tex, null, &dst);
     }
@@ -182,23 +188,23 @@ pub const Ui = struct {
         scanning: bool,
     ) void {
         self.clear();
-        self.renderTextCentered("Steam In-Home Streaming", 40, COLOR_FG, self.font);
+        self.renderTextCentered("LOCOMO", @divTrunc(self.logical_h, 16), COLOR_FG, self.font);
 
         if (scanning) {
-            self.renderTextCentered("Scanning for Steam hosts...", 100, COLOR_DIM, self.font_small);
+            self.renderTextCentered("Scanning for Steam hosts...", @divTrunc(self.logical_h, 8), COLOR_DIM, self.font_small);
         } else if (hosts.len == 0) {
-            self.renderTextCentered("No hosts found.", 100, COLOR_DIM, self.font_small);
+            self.renderTextCentered("No hosts found.  Press A to scan again.", @divTrunc(self.logical_h, 8), COLOR_DIM, self.font_small);
         }
 
-        const list_y: i32 = 160;
-        const row_h: i32 = 56;
+        const list_y: i32 = @divTrunc(self.logical_h, 5);
+        const row_h: i32 = @divTrunc(self.logical_h, 12);
         for (hosts, 0..) |host, i| {
             const y = list_y + @as(i32, @intCast(i)) * row_h;
             const is_sel = (i == self.host_cursor);
             const is_paired = (host.clientId == paired_client_id);
 
             if (is_sel) {
-                self.drawRect(60, y - 6, WINDOW_W - 120, row_h - 4, .{ .r = 30, .g = 50, .b = 100, .a = 255 });
+                self.drawRect(@divTrunc(self.logical_w, 12), y - 6, self.logical_w - @divTrunc(self.logical_w, 6), row_h - 4, .{ .r = 30, .g = 50, .b = 100, .a = 255 });
             }
 
             var name_buf: [80]u8 = undefined;
@@ -210,10 +216,10 @@ pub const Ui = struct {
                 std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch continue;
 
             const col = if (is_sel) COLOR_SEL else COLOR_FG;
-            self.renderText(label, 80, y, col, self.font);
+            self.renderText(label, @divTrunc(self.logical_w, 9), y, col, self.font);
         }
 
-        self.renderTextCentered("DPAD to navigate  A to connect  START for settings", WINDOW_H - 50, COLOR_DIM, self.font_small);
+        self.renderTextCentered("DPAD to navigate  A to connect  START for settings", self.logical_h - @divTrunc(self.logical_h, 12), COLOR_DIM, self.font_small);
         self.present();
     }
 
@@ -233,48 +239,8 @@ pub const Ui = struct {
 
     pub fn drawStatus(self: *Ui, msg: [:0]const u8) void {
         self.clear();
-        self.renderTextCentered(msg, @divTrunc(WINDOW_H, 2) - 14, COLOR_FG, self.font);
+        self.renderTextCentered(msg, @divTrunc(self.logical_h, 2) - 16, COLOR_FG, self.font);
         self.present();
-    }
-
-    // Screen: Reconnect - TODO: Reevaluate need for this... see similar in root.zig
-
-    pub fn drawReconnectScreen(self: *Ui, hostname: []const u8) void {
-        self.clear();
-        var hbuf: [80]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&hbuf, "Reconnect to {s}?", .{hostname}) catch {
-            self.renderTextCentered("Reconnect?", 200, COLOR_FG, self.font);
-            self.drawReconnectOptions();
-            return;
-        };
-        self.renderTextCentered(msg, 200, COLOR_FG, self.font);
-        self.drawReconnectOptions();
-        self.present();
-    }
-
-    fn drawReconnectOptions(self: *Ui) void {
-        const btn_w: i32 = 220;
-        const btn_h: i32 = 60;
-        const gap: i32 = 40;
-        const total = btn_w * 2 + gap;
-        const bx = @divTrunc(WINDOW_W - total, 2);
-        const by: i32 = 320;
-
-        const yes_col: c.SDL_Color = if (self.reconnect_choice == .reconnect) COLOR_SEL else COLOR_DIM;
-        const new_col: c.SDL_Color = if (self.reconnect_choice == .new_pair) COLOR_SEL else COLOR_DIM;
-
-        self.drawRectOutline(bx, by, btn_w, btn_h, yes_col);
-        self.renderText("Reconnect", bx + 30, by + 15, yes_col, self.font);
-        self.drawRectOutline(bx + btn_w + gap, by, btn_w, btn_h, new_col);
-        self.renderText("New Pair", bx + btn_w + gap + 30, by + 15, new_col, self.font);
-        self.renderTextCentered("DPAD Left/Right to choose  A to confirm", WINDOW_H - 50, COLOR_DIM, self.font_small);
-    }
-
-    pub fn reconnectToggle(self: *Ui) void {
-        self.reconnect_choice = switch (self.reconnect_choice) {
-            .reconnect => .new_pair,
-            .new_pair => .reconnect,
-        };
     }
 
     // Screen: PIN
@@ -285,15 +251,15 @@ pub const Ui = struct {
 
     pub fn drawPinDisplay(self: *Ui, pin: *const [4]u8) void {
         self.clear();
-        self.renderTextCentered("Pairing — enter this PIN on your PC", 60, COLOR_FG, self.font);
-        self.renderTextCentered("Type the PIN shown below into Steam, then wait.", 110, COLOR_DIM, self.font_small);
+        self.renderTextCentered("Pairing...", @divTrunc(self.logical_h, 12), COLOR_FG, self.font);
+        self.renderTextCentered("Type the PIN shown below into Steam on your PC.", @divTrunc(self.logical_h, 6), COLOR_DIM, self.font_small);
 
         const slot_w: i32 = 90;
         const slot_h: i32 = 110;
         const gap: i32 = 20;
         const total_w = 4 * slot_w + 3 * gap;
-        const start_x = @divTrunc(WINDOW_W - total_w, 2);
-        const slot_y: i32 = 200;
+        const start_x = @divTrunc(self.logical_w - total_w, 2);
+        const slot_y: i32 = @divTrunc(self.logical_h, 3);
 
         for (pin, 0..) |digit, i| {
             const x = start_x + @as(i32, @intCast(i)) * (slot_w + gap);
@@ -313,7 +279,7 @@ pub const Ui = struct {
             _ = c.SDL_RenderCopy(self.renderer, tex, null, &c.SDL_Rect{ .x = cx, .y = cy, .w = tw, .h = th });
         }
 
-        const status_y: i32 = 360;
+        const status_y: i32 = @divTrunc(self.logical_w, 3) + @divTrunc(self.logical_w, 6);
         switch (self.pin_status) {
             .idle, .waiting => self.renderTextCentered("Waiting for PC confirmation...  B = cancel", status_y, COLOR_DIM, self.font_small),
             .denied => self.renderTextCentered("PIN denied.", status_y, COLOR_ERR, self.font_small),
@@ -330,18 +296,18 @@ pub const Ui = struct {
 
     pub fn drawSettingsScreen(self: *Ui, s: config.Settings) void {
         self.clear();
-        self.renderTextCentered("Settings", 50, COLOR_FG, self.font);
+        self.renderTextCentered("Settings", @divTrunc(self.logical_h, 12), COLOR_FG, self.font);
 
-        const rows = [_][:0]const u8{ "Resolution", "Max Bandwidth", "H.265 / HEVC" };
-        const start_y: i32 = 160;
-        const row_h: i32 = 80;
+        const rows = [_][:0]const u8{ "Resolution", "Max Bandwidth", "H.265 / HEVC", "HW Decode" };
+        const start_y: i32 = @divTrunc(self.logical_h, 9) * 2;
+        const row_h: i32 = @divTrunc(self.logical_h, 9);
 
         for (rows, 0..) |row_name, i| {
             const y = start_y + @as(i32, @intCast(i)) * row_h;
             const is_sel = (i == self.settings_row);
             const label_col = if (is_sel) COLOR_SEL else COLOR_FG;
 
-            self.renderText(row_name, 100, y, label_col, self.font);
+            self.renderText(row_name, @divTrunc(self.logical_w, 6), y, label_col, self.font);
 
             var vbuf: [32]u8 = undefined;
             const val: [:0]const u8 = switch (i) {
@@ -356,19 +322,22 @@ pub const Ui = struct {
                 2 => blk: {
                     break :blk if (s.enable_hevc) "On" else "Off";
                 },
+                3 => blk: {
+                    break :blk if (s.hw_decode) "On" else "Off";
+                },
                 else => std.fmt.bufPrintZ(&vbuf, "", .{}) catch "",
             };
 
-            self.renderText(val, WINDOW_W - 300, y, label_col, self.font);
+            self.renderText(val, self.logical_w - @divTrunc(self.logical_w, 3), y, label_col, self.font);
         }
 
-        self.renderTextCentered("DPAD Up/Down = row  Left/Right = value  B = save", WINDOW_H - 50, COLOR_DIM, self.font_small);
+        self.renderTextCentered("DPAD Up/Down = row  Left/Right = value  B = save", self.logical_h - @divTrunc(self.logical_h, 12), COLOR_DIM, self.font_small);
         self.present();
     }
 
     pub fn settingsMoveRow(self: *Ui, delta: i32) void {
         const r: i32 = @intCast(self.settings_row);
-        self.settings_row = @intCast(@mod(r + delta + 3, 3));
+        self.settings_row = @intCast(@mod(r + delta + 4, 4));
     }
 
     pub fn settingsAdjust(self: *Ui, s: *config.Settings, delta: i32) void {
@@ -399,6 +368,9 @@ pub const Ui = struct {
             },
             2 => {
                 s.enable_hevc = !s.enable_hevc;
+            },
+            3 => {
+                s.hw_decode = !s.hw_decode;
             },
             else => {},
         }

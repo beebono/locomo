@@ -90,15 +90,26 @@ pub const AuthResult = enum { success, denied, failed };
 
 pub const AuthCtx = struct {
     done: std.atomic.Value(bool),
+    cancel: std.atomic.Value(bool),
+    client: std.atomic.Value(?*c.IHS_Client),
     result: AuthResult,
     steam_id: u64,
 
     pub fn init() AuthCtx {
         return .{
             .done = std.atomic.Value(bool).init(false),
+            .cancel = std.atomic.Value(bool).init(false),
+            .client = std.atomic.Value(?*c.IHS_Client).init(null),
             .result = .failed,
             .steam_id = 0,
         };
+    }
+
+    pub fn stop(self: *AuthCtx) void {
+        self.cancel.store(true, .release);
+        if (self.client.load(.acquire)) |client| {
+            c.IHS_ClientStop(client);
+        }
     }
 };
 
@@ -158,6 +169,12 @@ fn authThread(args: AuthArgs) void {
         args.ctx.done.store(true, .release);
         return;
     };
+    args.ctx.client.store(client, .release);
+    if (args.ctx.cancel.load(.acquire)) {
+        c.IHS_ClientDestroy(client);
+        args.ctx.done.store(true, .release);
+        return;
+    }
     c.IHS_ClientSetAuthorizationCallbacks(client, &auth_callbacks, args.ctx);
     _ = c.IHS_ClientStartDiscovery(client, 0);
     var auth_host = args.host;

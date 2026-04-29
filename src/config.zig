@@ -20,15 +20,16 @@ pub const Settings = struct {
     height: u32 = 720,
     max_bandwidth_kbps: u32 = 0,
     enable_hevc: bool = false,
+    hw_decode: bool = true,
 };
 
 const DeviceJson = struct { device_id: u64, secret_key: [32]u8, device_name: []const u8 };
 const PairedJson = struct { hostname: []const u8, client_id: u64, instance_id: u64, steam_id: u64 };
 
 fn configDir(allocator: std.mem.Allocator) ![]const u8 {
-    const home_ptr = std.c.getenv("HOME") orelse return error.HomeNotSet;
-    const home = std.mem.span(home_ptr);
-    return std.fs.path.join(allocator, &.{ home, ".config", "locomo" });
+    const exe_dir = try std.process.executableDirPathAlloc(io, allocator);
+    defer allocator.free(exe_dir);
+    return std.fs.path.join(allocator, &.{ exe_dir, "config" });
 }
 
 fn readFileToEnd(allocator: std.mem.Allocator, file: std.Io.File) ![]const u8 {

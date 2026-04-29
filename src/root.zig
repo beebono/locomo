@@ -10,7 +10,6 @@ const io = std.Options.debug_io;
 
 const Phase = enum {
     scan,
-    reconnect_prompt,
     pair,
     streaming,
     disconnected,
@@ -117,7 +116,7 @@ fn initAppState(allocator: std.mem.Allocator) !AppState {
         .settings = settings,
         .ui = ui,
         .selected_host = null,
-        .decode_ctx = decode.DecodeCtx.init(allocator),
+        .decode_ctx = decode.DecodeCtx.init(allocator, settings.hw_decode),
     };
 }
 
@@ -125,6 +124,29 @@ fn deinitAppState(state: *AppState) void {
     state.decode_ctx.deinit();
     state.ui.deinit();
     state.arena.deinit();
+}
+
+fn computeFrameDst(
+    renderer: *c.SDL_Renderer,
+    canvas_w: c_int,
+    canvas_h: c_int,
+    frame_w: c_int,
+    frame_h: c_int,
+) c.SDL_Rect {
+    var lw: c_int = 0;
+    var lh: c_int = 0;
+    c.SDL_RenderGetLogicalSize(renderer, &lw, &lh);
+    if (lw <= 0 or lh <= 0 or canvas_w <= 0 or canvas_h <= 0) {
+        return .{ .x = 0, .y = 0, .w = lw, .h = lh };
+    }
+    const dw = @divTrunc(frame_w * lw, canvas_w);
+    const dh = @divTrunc(frame_h * lh, canvas_h);
+    return .{
+        .x = @divTrunc(lw - dw, 2),
+        .y = @divTrunc(lh - dh, 2),
+        .w = dw,
+        .h = dh,
+    };
 }
 
 pub fn run(allocator: std.mem.Allocator) !void {
@@ -137,7 +159,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
     while (true) {
         switch (state.phase) {
             .scan => scanForHosts(&state),
-            .reconnect_prompt => reconnectPrompt(&state),
             .pair => pairWithPin(&state) catch |err| {
                 std.log.err("pair error: {}", .{err});
                 state.phase = .scan;
@@ -197,6 +218,13 @@ fn scanForHosts(state: *AppState) void {
                 disc_ctx.stop();
                 return;
             },
+            .button_b => {
+                if (confirmQuit(state)) {
+                    state.phase = .quit;
+                    disc_ctx.stop();
+                    return;
+                }
+            },
             .dpad_up => state.ui.moveScanCursor(-1, hosts.len),
             .dpad_down => state.ui.moveScanCursor(1, hosts.len),
             .button_a => {
@@ -204,57 +232,19 @@ fn scanForHosts(state: *AppState) void {
                 if (idx < hosts.len) {
                     state.selected_host = hosts[idx];
                     disc_ctx.stop();
-                    const sel = state.selected_host.?;
-                    if (state.paired) |p| {
-                        state.phase = if (sel.clientId == p.client_id) .reconnect_prompt else .pair;
-                    } else {
-                        state.phase = .pair;
-                    }
+                    state.phase = if (state.paired != null and state.selected_host.?.clientId == state.paired.?.client_id)
+                        .streaming
+                    else
+                        .pair;
+                    return;
+                } else if (disc_ctx.done.load(.acquire)) {
+                    disc_ctx.stop();
                     return;
                 }
             },
             else => {},
         }
 
-        if (disc_ctx.done.load(.acquire) and hosts.len == 0) {
-            state.ui.drawStatus("No hosts found. Press A to rescan.");
-            waitForA(state);
-            return;
-        }
-
-        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
-    }
-}
-
-// Reconnect prompt - TODO: Reevaluate need for this... Probably better to not display paired state and only attempt to re-pair if reconnect fails?
-
-fn reconnectPrompt(state: *AppState) void {
-    state.ui.reconnect_choice = .reconnect;
-    const p = state.paired.?;
-    const name_len = std.mem.indexOfScalar(u8, &p.hostname, 0) orelse p.hostname.len;
-    const hostname = p.hostname[0..name_len];
-
-    while (true) {
-        state.ui.drawReconnectScreen(hostname);
-        switch (state.ui.pollEvents()) {
-            .quit => {
-                state.phase = .quit;
-                return;
-            },
-            .dpad_left, .dpad_right => state.ui.reconnectToggle(),
-            .button_a => {
-                state.phase = switch (state.ui.reconnect_choice) {
-                    .reconnect => .streaming,
-                    .new_pair => .pair,
-                };
-                return;
-            },
-            .button_b => {
-                state.phase = .scan;
-                return;
-            },
-            else => {},
-        }
         io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
     }
 }
@@ -277,16 +267,20 @@ fn pairWithPin(state: *AppState) !void {
 
     while (!auth_ctx.done.load(.acquire)) {
         state.ui.drawPinDisplay(&pin);
-        const ev = state.ui.pollEvents();
-        if (ev == .quit) {
-            state.phase = .quit;
-            auth_thread.join();
-            return;
-        }
-        if (ev == .button_b) {
-            state.phase = .scan;
-            auth_thread.join();
-            return;
+        switch (state.ui.pollEvents()) {
+            .quit => {
+                state.phase = .quit;
+                auth_ctx.stop();
+                auth_thread.join();
+                return;
+            },
+            .button_b => {
+                state.phase = .scan;
+                auth_ctx.stop();
+                auth_thread.join();
+                return;
+            },
+            else => {},
         }
         io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
     }
@@ -337,11 +331,11 @@ fn beginStreaming(state: *AppState) !void {
     stream_thread.join();
 
     if (stream_ctx.result != .success) {
-        const msg: [:0]const u8 = switch (stream_ctx.result) {
-            .unauthorized => "Stream request rejected: not authorized.",
-            else => "Stream request failed.",
-        };
-        state.ui.drawStatus(msg);
+        if (stream_ctx.result == .unauthorized) {
+            state.phase = .pair;
+            return;
+        }
+        state.ui.drawStatus("Stream request failed.");
         io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
         state.phase = .disconnected;
         return;
@@ -375,8 +369,8 @@ fn beginStreaming(state: *AppState) !void {
         return;
     }
 
-    // Gamepad input passthrough, defer until connected or Host immediately
-    // refuses the connection thinking something went wrong.
+    // Gamepad input passthrough, defer until connected or else the
+    // Host will immediately refuse the connection thinking something went wrong.
     var hid_initialized = false;
     defer if (hid_initialized) input.deinit();
 
@@ -407,7 +401,7 @@ fn beginStreaming(state: *AppState) !void {
                 if (texture) |t| c.SDL_DestroyTexture(t);
                 texture = c.SDL_CreateTexture(
                     state.ui.renderer,
-                    c.SDL_PIXELFORMAT_IYUV,
+                    c.SDL_PIXELFORMAT_NV12,
                     c.SDL_TEXTUREACCESS_STREAMING,
                     @intCast(frame.width),
                     @intCast(frame.height),
@@ -416,15 +410,39 @@ fn beginStreaming(state: *AppState) !void {
                 tex_h = frame.height;
             }
             if (texture) |t| {
-                _ = c.SDL_UpdateYUVTexture(t, null, frame.y.ptr, frame.y_stride, frame.u.ptr, frame.u_stride, frame.v.ptr, frame.v_stride);
+                _ = c.SDL_UpdateNVTexture(t, null, frame.y.ptr, frame.y_stride, frame.uv.ptr, frame.uv_stride);
             }
-            frame.deinit();
-        }
 
-        _ = c.SDL_SetRenderDrawColor(state.ui.renderer, 0, 0, 0, 255);
-        _ = c.SDL_RenderClear(state.ui.renderer);
-        if (texture) |t| _ = c.SDL_RenderCopy(state.ui.renderer, t, null, null);
-        c.SDL_RenderPresent(state.ui.renderer);
+            _ = c.SDL_SetRenderDrawColor(state.ui.renderer, 0, 0, 0, 255);
+            _ = c.SDL_RenderClear(state.ui.renderer);
+            if (texture) |t| {
+                const dst = computeFrameDst(
+                    state.ui.renderer,
+                    @intCast(state.settings.width),
+                    @intCast(state.settings.height),
+                    @intCast(frame.width),
+                    @intCast(frame.height),
+                );
+                _ = c.SDL_RenderCopy(state.ui.renderer, t, null, &dst);
+            }
+            c.SDL_RenderPresent(state.ui.renderer);
+
+            frame.deinit();
+        } else {
+            _ = c.SDL_SetRenderDrawColor(state.ui.renderer, 0, 0, 0, 255);
+            _ = c.SDL_RenderClear(state.ui.renderer);
+            if (texture) |t| {
+                const dst = computeFrameDst(
+                    state.ui.renderer,
+                    @intCast(state.settings.width),
+                    @intCast(state.settings.height),
+                    @intCast(frame.width),
+                    @intCast(frame.height),
+                );
+                _ = c.SDL_RenderCopy(state.ui.renderer, t, null, &dst);
+            }
+            c.SDL_RenderPresent(state.ui.renderer);
+        }
     }
 
     c.IHS_SessionDisconnect(session);
@@ -448,6 +466,7 @@ fn settingsScreen(state: *AppState) void {
             },
             .button_b, .button_start => {
                 state.settings = s;
+                state.decode_ctx.hw_decode = s.hw_decode;
                 config.saveSettings(state.allocator, s) catch {};
                 return;
             },
@@ -478,6 +497,18 @@ fn waitForAorB(state: *AppState) ui_mod.UiEvent {
         const ev = state.ui.pollEvents();
         switch (ev) {
             .button_a, .button_b, .quit => return ev,
+            else => {},
+        }
+        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+    }
+}
+
+fn confirmQuit(state: *AppState) bool {
+    state.ui.drawStatus("Press Start to quit or B to resume.");
+    while (true) {
+        switch (state.ui.pollEvents()) {
+            .button_start, .quit => return true,
+            .button_b => return false,
             else => {},
         }
         io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};

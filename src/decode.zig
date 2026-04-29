@@ -1,6 +1,11 @@
 const std = @import("std");
 const c = @import("c.zig").c;
+const Io = std.Io;
 const io = std.Options.debug_io;
+
+inline fn alignUp16(v: c_int) c_int {
+    return (v + 15) & ~@as(c_int, 15);
+}
 
 const SLOT_CAP: usize = 512 * 1024;
 const RING_SLOTS: usize = 32;
@@ -84,19 +89,16 @@ const PacketRing = struct {
 
 pub const VideoFrame = struct {
     y: []u8,
-    u: []u8,
-    v: []u8,
+    uv: []u8,
     width: u32,
     height: u32,
     y_stride: c_int,
-    u_stride: c_int,
-    v_stride: c_int,
+    uv_stride: c_int,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *VideoFrame) void {
         self.allocator.free(self.y);
-        self.allocator.free(self.u);
-        self.allocator.free(self.v);
+        self.allocator.free(self.uv);
     }
 };
 
@@ -104,15 +106,27 @@ pub const DecodeCtx = struct {
     allocator: std.mem.Allocator,
 
     // Video
+    hw_decode: bool,
+    codec_id: c.AVCodecID,
     video_codec_ctx: ?*c.AVCodecContext,
-    video_sws_ctx: ?*c.SwsContext,
+    canvas_w: c_int,
+    canvas_h: c_int,
+    req_w: c_int,
+    req_h: c_int,
+    last_sps_w: c_int,
+    last_sps_h: c_int,
+    parser: ?*c.AVCodecParserContext,
     av_frame: ?*c.AVFrame,
-    av_yuv_frame: ?*c.AVFrame,
+    av_sw_frame: ?*c.AVFrame,
     pending_frame: ?VideoFrame,
     frame_ready: std.atomic.Value(bool),
     video_ring: ?PacketRing,
     video_thread: ?std.Thread,
     video_lost: std.atomic.Value(bool),
+    need_keyframe: std.atomic.Value(bool),
+    pending_resize: std.atomic.Value(bool),
+    pending_w: std.atomic.Value(i32),
+    pending_h: std.atomic.Value(i32),
 
     // Audio
     audio_codec_ctx: ?*c.AVCodecContext,
@@ -121,18 +135,30 @@ pub const DecodeCtx = struct {
     audio_resample_buf: [*c]u8,
     audio_resample_buf_size: c_int,
 
-    pub fn init(allocator: std.mem.Allocator) DecodeCtx {
+    pub fn init(allocator: std.mem.Allocator, hw_decode: bool) DecodeCtx {
         return .{
             .allocator = allocator,
+            .hw_decode = hw_decode,
+            .codec_id = c.AV_CODEC_ID_NONE,
             .video_codec_ctx = null,
-            .video_sws_ctx = null,
+            .canvas_w = 0,
+            .canvas_h = 0,
+            .req_w = 0,
+            .req_h = 0,
+            .last_sps_w = 0,
+            .last_sps_h = 0,
+            .parser = null,
             .av_frame = null,
-            .av_yuv_frame = null,
+            .av_sw_frame = null,
             .pending_frame = null,
             .frame_ready = std.atomic.Value(bool).init(false),
             .video_ring = null,
             .video_thread = null,
             .video_lost = std.atomic.Value(bool).init(false),
+            .need_keyframe = std.atomic.Value(bool).init(false),
+            .pending_resize = std.atomic.Value(bool).init(false),
+            .pending_w = std.atomic.Value(i32).init(0),
+            .pending_h = std.atomic.Value(i32).init(0),
             .audio_codec_ctx = null,
             .audio_swr_ctx = null,
             .audio_device = 0,
@@ -153,9 +179,9 @@ pub const DecodeCtx = struct {
         }
         if (self.pending_frame) |*f| f.deinit();
         self.pending_frame = null;
-        if (self.av_yuv_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
+        if (self.av_sw_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
         if (self.av_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
-        if (self.video_sws_ctx) |s| c.sws_freeContext(s);
+        if (self.parser) |p| c.av_parser_close(p);
         if (self.video_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
         if (self.audio_swr_ctx) |s| c.swr_free(@ptrCast(@constCast(&s)));
         if (self.audio_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
@@ -175,6 +201,75 @@ pub const DecodeCtx = struct {
 
 // Callbacks: Video
 
+fn applyExtradata(cc: *c.AVCodecContext, data: ?[]const u8) void {
+    const bytes = data orelse return;
+    if (bytes.len == 0) return;
+    cc.extradata = @ptrCast(c.av_malloc(bytes.len + c.AV_INPUT_BUFFER_PADDING_SIZE));
+    if (cc.extradata == null) return;
+    @memcpy(cc.extradata[0..bytes.len], bytes);
+    @memset(cc.extradata[bytes.len .. bytes.len + c.AV_INPUT_BUFFER_PADDING_SIZE], 0);
+    cc.extradata_size = @intCast(bytes.len);
+}
+
+fn openCandidate(w: c_int, h: c_int, extradata: ?[]const u8, name: [*:0]const u8, hw_type: c.AVHWDeviceType) ?*c.AVCodecContext {
+    const codec = c.avcodec_find_decoder_by_name(name) orelse return null;
+    const cc = c.avcodec_alloc_context3(codec) orelse return null;
+    cc.*.width = w;
+    cc.*.height = h;
+    applyExtradata(cc, extradata);
+    if (hw_type != c.AV_HWDEVICE_TYPE_NONE) {
+        if (c.av_hwdevice_ctx_create(&cc.*.hw_device_ctx, hw_type, null, null, 0) < 0) {
+            c.avcodec_free_context(@ptrCast(@constCast(&cc)));
+            return null;
+        }
+    }
+    if (c.avcodec_open2(cc, codec, null) < 0) {
+        c.avcodec_free_context(@ptrCast(@constCast(&cc)));
+        return null;
+    }
+    return cc;
+}
+
+fn openSoftware(w: c_int, h: c_int, extradata: ?[]const u8, codec_id: c.AVCodecID) ?*c.AVCodecContext {
+    const codec = c.avcodec_find_decoder(codec_id) orelse return null;
+    const cc = c.avcodec_alloc_context3(codec) orelse return null;
+    cc.*.width = w;
+    cc.*.height = h;
+    applyExtradata(cc, extradata);
+    if (c.avcodec_open2(cc, codec, null) < 0) {
+        c.avcodec_free_context(@ptrCast(@constCast(&cc)));
+        return null;
+    }
+    return cc;
+}
+
+fn selectCodec(codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extradata: ?[]const u8) ?*c.AVCodecContext {
+    const Candidate = struct {
+        name: [*:0]const u8,
+        hw_type: c.AVHWDeviceType,
+    };
+    const is_hevc = codec_id == c.AV_CODEC_ID_HEVC;
+    const hw_candidates: []const Candidate = if (is_hevc) &.{
+        .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+        .{ .name = "hevc_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+    } else &.{
+        .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+        .{ .name = "h264_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+    };
+    if (hw_decode) {
+        for (hw_candidates) |cand| {
+            if (openCandidate(w, h, extradata, cand.name, cand.hw_type)) |cc| {
+                std.debug.print("[decode] using {s} ({d}x{d})\n", .{ cand.name, w, h });
+                return cc;
+            }
+        }
+        std.debug.print("[decode] no HW decoder available, falling back to SW\n", .{});
+    } else {
+        std.debug.print("[decode] using SW decoder (hw_decode=off)\n", .{});
+    }
+    return openSoftware(w, h, extradata, codec_id);
+}
+
 fn videoStart(
     session: ?*c.IHS_Session,
     config: ?*const c.IHS_StreamVideoConfig,
@@ -188,51 +283,24 @@ fn videoStart(
         c.IHS_StreamVideoCodecHEVC => c.AV_CODEC_ID_HEVC,
         else => c.AV_CODEC_ID_H264,
     };
+    ctx.codec_id = codec_id;
 
-    const sw_codec = c.avcodec_find_decoder(codec_id) orelse return -1;
-
-    // Try hardware decoder if enabled, fall back to software otherwise
-    // TODO: Add hw/sw decode setting
-    const codec_ctx: *c.AVCodecContext = hw: {
-        const hw_name: [*c]const u8 = if (codec_id == c.AV_CODEC_ID_HEVC) "hevc_v4l2m2m" else "h264_v4l2m2m";
-        if (c.avcodec_find_decoder_by_name(hw_name)) |hw_codec| {
-            if (c.avcodec_alloc_context3(hw_codec)) |hw_ctx| {
-                hw_ctx.*.width = @intCast(cfg.width);
-                hw_ctx.*.height = @intCast(cfg.height);
-                if (cfg.codecDataLen > 0 and cfg.codecData != null) {
-                    hw_ctx.*.extradata = @ptrCast(c.av_malloc(cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE));
-                    if (hw_ctx.*.extradata != null) {
-                        @memcpy(hw_ctx.*.extradata[0..cfg.codecDataLen], cfg.codecData[0..cfg.codecDataLen]);
-                        @memset(hw_ctx.*.extradata[cfg.codecDataLen .. cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE], 0);
-                        hw_ctx.*.extradata_size = @intCast(cfg.codecDataLen);
-                    }
-                }
-                _ = c.av_hwdevice_ctx_create(&hw_ctx.*.hw_device_ctx, c.AV_HWDEVICE_TYPE_DRM, "/dev/dri/card0", null, 0);
-                if (c.avcodec_open2(hw_ctx, hw_codec, null) == 0) break :hw hw_ctx;
-                c.avcodec_free_context(@ptrCast(@constCast(&hw_ctx)));
-            }
-        }
-        const sw_ctx = c.avcodec_alloc_context3(sw_codec) orelse return -1;
-        sw_ctx.*.width = @intCast(cfg.width);
-        sw_ctx.*.height = @intCast(cfg.height);
-        if (cfg.codecDataLen > 0 and cfg.codecData != null) {
-            sw_ctx.*.extradata = @ptrCast(c.av_malloc(cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE));
-            if (sw_ctx.*.extradata != null) {
-                @memcpy(sw_ctx.*.extradata[0..cfg.codecDataLen], cfg.codecData[0..cfg.codecDataLen]);
-                @memset(sw_ctx.*.extradata[cfg.codecDataLen .. cfg.codecDataLen + c.AV_INPUT_BUFFER_PADDING_SIZE], 0);
-                sw_ctx.*.extradata_size = @intCast(cfg.codecDataLen);
-            }
-        }
-        if (c.avcodec_open2(sw_ctx, sw_codec, null) < 0) {
-            c.avcodec_free_context(@ptrCast(@constCast(&sw_ctx)));
-            return -1;
-        }
-        break :hw sw_ctx;
-    };
+    const extradata: ?[]const u8 = if (cfg.codecDataLen > 0 and cfg.codecData != null)
+        cfg.codecData[0..cfg.codecDataLen]
+    else
+        null;
+    const width = alignUp16(@intCast(cfg.width));
+    const height = alignUp16(@intCast(cfg.height));
+    const codec_ctx = selectCodec(codec_id, ctx.hw_decode, width, height, extradata) orelse return -1;
 
     ctx.video_codec_ctx = codec_ctx;
+    ctx.canvas_w = width;
+    ctx.canvas_h = height;
+    ctx.req_w = width;
+    ctx.req_h = height;
+    ctx.parser = c.av_parser_init(@intCast(codec_id));
     ctx.av_frame = c.av_frame_alloc();
-    ctx.av_yuv_frame = c.av_frame_alloc();
+    ctx.av_sw_frame = c.av_frame_alloc();
 
     ctx.video_ring = PacketRing.init(ctx.allocator) catch {
         c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
@@ -247,6 +315,23 @@ fn videoStart(
         return -1;
     };
 
+    return 0;
+}
+
+fn videoSetCaptureSize(
+    session: ?*c.IHS_Session,
+    width: c_int,
+    height: c_int,
+    ctx_ptr: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = session;
+    const ctx: *DecodeCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    ctx.canvas_w = width;
+    ctx.canvas_h = height;
+    ctx.pending_w.store(alignUp16(@intCast(width)), .release);
+    ctx.pending_h.store(alignUp16(@intCast(height)), .release);
+    ctx.pending_resize.store(true, .release);
+    ctx.need_keyframe.store(true, .release);
     return 0;
 }
 
@@ -265,8 +350,18 @@ fn videoSubmit(
     const data_len = buf.size;
     const is_keyframe = (flags & c.IHS_StreamVideoFrameKeyFrame) != 0;
 
+    if (ctx.need_keyframe.load(.acquire)) {
+        if (!is_keyframe) {
+            std.debug.print("[decode] need_keyframe set, but didn't get a keyframe!\n", .{});
+            return c.IHS_StreamVideoSubmitReportLost;
+        }
+        ctx.need_keyframe.store(false, .release);
+    }
+
     if (!ring.tryPush(data_ptr[0..data_len], is_keyframe)) {
         ctx.video_lost.store(true, .release);
+        ctx.need_keyframe.store(true, .release);
+        std.debug.print("[decode] Couldn't push to decoder, requesting a keyframe!\n", .{});
         return c.IHS_StreamVideoSubmitReportLost;
     }
     return c.IHS_StreamVideoSubmitOK;
@@ -275,7 +370,7 @@ fn videoSubmit(
 fn drainDecoder(ctx: *DecodeCtx) bool {
     const codec_ctx = ctx.video_codec_ctx orelse return false;
     const av_frame = ctx.av_frame orelse return false;
-    const yuv_frame = ctx.av_yuv_frame orelse return false;
+    const sw_frame = ctx.av_sw_frame orelse return false;
 
     var produced = false;
     while (true) {
@@ -284,73 +379,79 @@ fn drainDecoder(ctx: *DecodeCtx) bool {
         defer c.av_frame_unref(av_frame);
         produced = true;
 
-        const w = av_frame.width;
-        const h = av_frame.height;
+        const is_hw = av_frame.hw_frames_ctx != null;
+        if (is_hw) {
+            c.av_frame_unref(sw_frame);
+            if (c.av_hwframe_transfer_data(sw_frame, av_frame, 0) < 0) continue;
+        }
+        const src: *c.AVFrame = if (is_hw) sw_frame else av_frame;
+        defer if (is_hw) c.av_frame_unref(sw_frame);
 
-        const sws = c.sws_getCachedContext(
-            ctx.video_sws_ctx,
-            w,
-            h,
-            av_frame.format,
-            w,
-            h,
-            c.AV_PIX_FMT_YUV420P,
-            c.SWS_BILINEAR,
-            null,
-            null,
-            null,
-        );
-        ctx.video_sws_ctx = sws;
-        if (sws == null) continue;
+        const w = src.width;
+        const h = src.height;
 
-        c.av_frame_unref(yuv_frame);
-        yuv_frame.width = w;
-        yuv_frame.height = h;
-        yuv_frame.format = c.AV_PIX_FMT_YUV420P;
-        if (c.av_frame_get_buffer(yuv_frame, 1) < 0) continue;
-        _ = c.sws_scale(sws, @ptrCast(&av_frame.data), @ptrCast(&av_frame.linesize), 0, h, @ptrCast(&yuv_frame.data), @ptrCast(&yuv_frame.linesize));
+        const uv_h = @divTrunc(h, 2);
+        const y_stride = src.linesize[0];
+        const y_sz: usize = @intCast(y_stride * h);
 
-        const y_sz: usize = @intCast(yuv_frame.linesize[0] * h);
-        const u_sz: usize = @intCast(yuv_frame.linesize[1] * @divTrunc(h, 2));
-        const v_sz: usize = @intCast(yuv_frame.linesize[2] * @divTrunc(h, 2));
+        const plane_y = ctx.allocator.alloc(u8, y_sz) catch continue;
+        @memcpy(plane_y, src.data[0][0..y_sz]);
 
-        const plane_y = ctx.allocator.alloc(u8, y_sz) catch {
-            c.av_frame_unref(yuv_frame);
-            continue;
-        };
-        const plane_u = ctx.allocator.alloc(u8, u_sz) catch {
-            ctx.allocator.free(plane_y);
-            c.av_frame_unref(yuv_frame);
-            continue;
-        };
-        const plane_v = ctx.allocator.alloc(u8, v_sz) catch {
-            ctx.allocator.free(plane_y);
-            ctx.allocator.free(plane_u);
-            c.av_frame_unref(yuv_frame);
-            continue;
-        };
+        var uv_stride: c_int = 0;
+        var plane_uv: []u8 = undefined;
+        switch (src.format) {
+            c.AV_PIX_FMT_NV12 => {
+                uv_stride = src.linesize[1];
+                const uv_sz: usize = @intCast(uv_stride * uv_h);
+                plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
+                    ctx.allocator.free(plane_y);
+                    continue;
+                };
+                @memcpy(plane_uv, src.data[1][0..uv_sz]);
+            },
+            c.AV_PIX_FMT_YUV420P => {
+                uv_stride = w;
+                const uv_sz: usize = @intCast(uv_stride * uv_h);
+                plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
+                    ctx.allocator.free(plane_y);
+                    continue;
+                };
+                const u_stride: usize = @intCast(src.linesize[1]);
+                const v_stride: usize = @intCast(src.linesize[2]);
+                const half_w: usize = @intCast(@divTrunc(w, 2));
+                const dst_stride: usize = @intCast(uv_stride);
+                var row: usize = 0;
+                while (row < @as(usize, @intCast(uv_h))) : (row += 1) {
+                    const u_row = src.data[1][row * u_stride ..];
+                    const v_row = src.data[2][row * v_stride ..];
+                    const dst = plane_uv[row * dst_stride ..];
+                    var col: usize = 0;
+                    while (col < half_w) : (col += 1) {
+                        dst[col * 2] = u_row[col];
+                        dst[col * 2 + 1] = v_row[col];
+                    }
+                }
+            },
+            else => {
+                std.debug.print("[decode] unsupported pixel format {d}\n", .{src.format});
+                ctx.allocator.free(plane_y);
+                continue;
+            },
+        }
 
         const new_frame = VideoFrame{
             .y = plane_y,
-            .u = plane_u,
-            .v = plane_v,
+            .uv = plane_uv,
             .width = @intCast(w),
             .height = @intCast(h),
-            .y_stride = yuv_frame.linesize[0],
-            .u_stride = yuv_frame.linesize[1],
-            .v_stride = yuv_frame.linesize[2],
+            .y_stride = y_stride,
+            .uv_stride = uv_stride,
             .allocator = ctx.allocator,
         };
 
-        @memcpy(new_frame.y, yuv_frame.data[0][0..y_sz]);
-        @memcpy(new_frame.u, yuv_frame.data[1][0..u_sz]);
-        @memcpy(new_frame.v, yuv_frame.data[2][0..v_sz]);
-        c.av_frame_unref(yuv_frame);
-
         if (ctx.frame_ready.load(.acquire)) {
             ctx.allocator.free(new_frame.y);
-            ctx.allocator.free(new_frame.u);
-            ctx.allocator.free(new_frame.v);
+            ctx.allocator.free(new_frame.uv);
         } else {
             ctx.pending_frame = new_frame;
             ctx.frame_ready.store(true, .release);
@@ -359,8 +460,24 @@ fn drainDecoder(ctx: *DecodeCtx) bool {
     return produced;
 }
 
+fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) bool {
+    if (ctx.video_codec_ctx) |old| {
+        _ = c.avcodec_send_packet(old, null);
+        _ = drainDecoder(ctx);
+        var old_mut: ?*c.AVCodecContext = old;
+        c.avcodec_free_context(&old_mut);
+    }
+    ctx.video_codec_ctx = null;
+    const aligned_w = alignUp16(@intCast(w));
+    const aligned_h = alignUp16(@intCast(h));
+    const cc = selectCodec(ctx.codec_id, ctx.hw_decode, aligned_w, aligned_h, null) orelse return false;
+    ctx.video_codec_ctx = cc;
+    ctx.req_w = aligned_w;
+    ctx.req_h = aligned_h;
+    return true;
+}
+
 fn videoDecodeThread(ctx: *DecodeCtx) void {
-    const codec_ctx = ctx.video_codec_ctx orelse return;
     const ring = if (ctx.video_ring) |*r| r else return;
 
     const scratch = ctx.allocator.alloc(u8, SLOT_CAP) catch return;
@@ -374,11 +491,50 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
 
         if (ctx.video_lost.swap(false, .acq_rel)) waiting_for_keyframe = true;
 
+        if (ctx.parser) |parser| {
+            if (ctx.video_codec_ctx) |cc| {
+                var out_data: [*c]u8 = null;
+                var out_size: c_int = 0;
+                _ = c.av_parser_parse2(
+                    parser,
+                    cc,
+                    &out_data,
+                    &out_size,
+                    scratch.ptr,
+                    @intCast(n),
+                    c.AV_NOPTS_VALUE,
+                    c.AV_NOPTS_VALUE,
+                    0,
+                );
+                if (parser.*.width > 0 and parser.*.height > 0) {
+                    ctx.last_sps_w = alignUp16(parser.*.width);
+                    ctx.last_sps_h = alignUp16(parser.*.height);
+                }
+            }
+        }
+
         if (waiting_for_keyframe) {
             if (!is_keyframe) continue;
-            c.avcodec_flush_buffers(codec_ctx);
+            if (ctx.pending_resize.load(.acquire)) {
+                const new_w = ctx.pending_w.load(.acquire);
+                const new_h = ctx.pending_h.load(.acquire);
+                if (new_w != ctx.req_w or new_h != ctx.req_h) {
+                    std.debug.print("[decode] reinit codec for resize {d}x{d}\n", .{ new_w, new_h });
+                    if (!rebuildCodec(ctx, new_w, new_h)) {
+                        ctx.need_keyframe.store(true, .release);
+                        continue;
+                    }
+                } else if (ctx.video_codec_ctx) |cc| {
+                    c.avcodec_flush_buffers(cc);
+                }
+                ctx.pending_resize.store(false, .release);
+            } else if (ctx.video_codec_ctx) |cc| {
+                c.avcodec_flush_buffers(cc);
+            }
             waiting_for_keyframe = false;
         }
+
+        const codec_ctx = ctx.video_codec_ctx orelse return;
 
         const pkt = c.av_packet_alloc() orelse continue;
         defer c.av_packet_free(@ptrCast(@constCast(&pkt)));
@@ -387,14 +543,34 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
         if (is_keyframe) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
 
         const eagain: c_int = -@as(c_int, @intCast(c.EAGAIN));
+        var eagain_retries: u32 = 0;
         send: while (true) {
             const ret = c.avcodec_send_packet(codec_ctx, pkt);
             if (ret == 0) break :send;
             if (ret == eagain) {
-                _ = drainDecoder(ctx);
+                const drained = drainDecoder(ctx);
+                if (!drained) {
+                    eagain_retries += 1;
+                    if (eagain_retries > 4) {
+                        std.debug.print("[decode] EAGAIN stuck, forcing rebuild\n", .{});
+                        const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
+                        const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
+                        _ = rebuildCodec(ctx, fb_w, fb_h);
+                        waiting_for_keyframe = true;
+                        ctx.need_keyframe.store(true, .release);
+                        break :send;
+                    }
+                } else {
+                    eagain_retries = 0;
+                }
                 continue;
             }
+            const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
+            const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
+            std.debug.print("[decode] send_packet failed (ret={d}), rebuilding at {d}x{d}\n", .{ ret, fb_w, fb_h });
+            _ = rebuildCodec(ctx, fb_w, fb_h);
             waiting_for_keyframe = true;
+            ctx.need_keyframe.store(true, .release);
             break :send;
         }
 
@@ -419,17 +595,17 @@ fn videoStop(
         ctx.video_ring = null;
     }
 
-    if (ctx.av_yuv_frame) |f| {
+    if (ctx.av_sw_frame) |f| {
         c.av_frame_free(@ptrCast(@constCast(&f)));
-        ctx.av_yuv_frame = null;
+        ctx.av_sw_frame = null;
     }
     if (ctx.av_frame) |f| {
         c.av_frame_free(@ptrCast(@constCast(&f)));
         ctx.av_frame = null;
     }
-    if (ctx.video_sws_ctx) |s| {
-        c.sws_freeContext(s);
-        ctx.video_sws_ctx = null;
+    if (ctx.parser) |p| {
+        c.av_parser_close(p);
+        ctx.parser = null;
     }
     if (ctx.video_codec_ctx) |cc| {
         c.avcodec_free_context(@ptrCast(@constCast(&cc)));
@@ -583,7 +759,7 @@ pub const video_callbacks = c.IHS_StreamVideoCallbacks{
     .start = videoStart,
     .submit = videoSubmit,
     .stop = videoStop,
-    .setCaptureSize = null,
+    .setCaptureSize = videoSetCaptureSize,
 };
 
 pub const audio_callbacks = c.IHS_StreamAudioCallbacks{
