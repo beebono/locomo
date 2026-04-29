@@ -155,6 +155,27 @@ build_protobuf_c() {
     echo "    protobuf-c done."
 }
 
+build_rkmpp() {
+    echo ""
+    echo "==> Building rkmpp..."
+
+    local src="$REPO_ROOT/external/rkmpp"
+    local build="$BUILD_DIR/rkmpp"
+
+    mkdir -p "$build"
+
+    # shellcheck disable=SC2046
+    cmake -S "$src" -B "$build" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
+        -DBUILD_TEST=OFF \
+        $(cmake_cross_flags)
+
+    cmake --build "$build" --parallel "$JOBS"
+    cmake --install "$build"
+
+    echo "    rkmpp done."
+}
+
 build_ffmpeg() {
     echo ""
     echo "==> Building FFmpeg..."
@@ -166,6 +187,7 @@ build_ffmpeg() {
     cd "$build"
 
     local cross_prefix_flags=()
+    local pkg_config_path="$LIBS_DIR/lib/pkgconfig"
     if [ -n "$TARGET" ]; then
         cross_prefix_flags+=(
             "--cross-prefix=${TARGET}-"
@@ -173,8 +195,10 @@ build_ffmpeg() {
             "--target-os=linux"
             "--enable-cross-compile"
         )
+        pkg_config_path="$pkg_config_path:/usr/lib/${TARGET}/pkgconfig:/usr/share/pkgconfig"
     fi
 
+    PKG_CONFIG_LIBDIR="$pkg_config_path" PKG_CONFIG_PATH="$pkg_config_path" \
     "$src/configure" \
         --prefix="$LIBS_DIR" --bindir="$BUILD_DIR/ffmpeg-bin" \
         --enable-static --disable-shared \
@@ -185,8 +209,11 @@ build_ffmpeg() {
         --enable-parser=h264 --enable-parser=hevc \
         --enable-parser=aac --enable-parser=opus \
         --enable-decoder=h264 --enable-decoder=hevc \
+        --enable-decoder=h264_v4l2m2m --enable-decoder=hevc_v4l2m2m \
+        --enable-decoder=h264_rkmpp --enable-decoder=hevc_rkmpp \
         --enable-decoder=aac --enable-decoder=opus \
-        --enable-v4l2-m2m \
+        --enable-v4l2-m2m --enable-rkmpp \
+        --enable-libdrm --enable-version3 \
         --disable-avdevice --disable-avfilter \
         --disable-doc --disable-programs \
         --enable-pic --enable-optimizations \
@@ -204,6 +231,7 @@ build_sdl2
 build_sdl2_ttf
 build_mbedtls
 build_protobuf_c
+build_rkmpp
 build_ffmpeg
 
 echo ""
