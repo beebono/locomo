@@ -25,7 +25,6 @@ pub const UiEvent = enum {
 };
 
 pub const PinStatus = enum { idle, waiting, denied, failed };
-pub const ResOption = enum { r720, r1080, r1440 };
 
 pub const Ui = struct {
     window: *c.SDL_Window,
@@ -290,17 +289,13 @@ pub const Ui = struct {
 
     // Screen: Settings
 
-    const res_labels = [_][:0]const u8{ "1280x720", "1920x1080", "2560x1440" };
-    const bw_labels = [_][:0]const u8{ "5 Mbps", "10 Mbps", "20 Mbps", "30 Mbps", "Unlimited" };
-    const bw_values = [_]u32{ 5000, 10000, 20000, 30000, 0 };
-
     pub fn drawSettingsScreen(self: *Ui, s: config.Settings) void {
         self.clear();
         self.renderTextCentered("Settings", @divTrunc(self.logical_h, 12), COLOR_FG, self.font);
 
-        const rows = [_][:0]const u8{ "Resolution", "Max Bandwidth", "H.265 / HEVC", "HW Decode" };
+        const rows = [_][:0]const u8{ "Quality Preset", "Resolution", "Bandwidth Limit", "Framerate Limit", "Audio Type", "H.265 / HEVC", "HW Decode" };
         const start_y: i32 = @divTrunc(self.logical_h, 9) * 2;
-        const row_h: i32 = @divTrunc(self.logical_h, 9);
+        const row_h: i32 = @divTrunc(self.logical_h, 12);
 
         for (rows, 0..) |row_name, i| {
             const y = start_y + @as(i32, @intCast(i)) * row_h;
@@ -312,17 +307,33 @@ pub const Ui = struct {
             var vbuf: [32]u8 = undefined;
             const val: [:0]const u8 = switch (i) {
                 0 => blk: {
-                    const ri = resIndex(s.width, s.height);
-                    break :blk res_labels[ri];
+                    const qi = qualityIndex(s.quality);
+                    break :blk config.quality_options[qi].label;
                 },
                 1 => blk: {
-                    const bi = bwIndex(s.max_bandwidth_kbps);
-                    break :blk bw_labels[bi];
+                    const ri = resIndex(s.width, s.height);
+                    const opt = config.resolution_options[ri];
+                    if (opt.width == 0 or opt.height == 0) {
+                        break :blk std.fmt.bufPrintZ(&vbuf, "{s} ({d}x{d})", .{ opt.label, self.logical_w, self.logical_h }) catch opt.label;
+                    }
+                    break :blk opt.label;
                 },
                 2 => blk: {
-                    break :blk if (s.enable_hevc) "On" else "Off";
+                    const bi = bwIndex(s.max_bandwidth_kbps);
+                    break :blk config.bandwidth_options[bi].label;
                 },
                 3 => blk: {
+                    const fi = frIndex(s.framerate_limit);
+                    break :blk config.framerate_options[fi].label;
+                },
+                4 => blk: {
+                    const ai = audioIndex(s.audio_channels);
+                    break :blk config.audio_options[ai].label;
+                },
+                5 => blk: {
+                    break :blk if (s.enable_hevc) "On" else "Off";
+                },
+                6 => blk: {
                     break :blk if (s.hw_decode) "On" else "Off";
                 },
                 else => std.fmt.bufPrintZ(&vbuf, "", .{}) catch "",
@@ -331,61 +342,91 @@ pub const Ui = struct {
             self.renderText(val, self.logical_w - @divTrunc(self.logical_w, 3), y, label_col, self.font);
         }
 
-        self.renderTextCentered("DPAD Up/Down = row  Left/Right = value  B = save", self.logical_h - @divTrunc(self.logical_h, 12), COLOR_DIM, self.font_small);
+        self.renderTextCentered("DPAD Up/Down = select  Left/Right/A = value  B = save", self.logical_h - @divTrunc(self.logical_h, 12), COLOR_DIM, self.font_small);
         self.present();
     }
 
     pub fn settingsMoveRow(self: *Ui, delta: i32) void {
         const r: i32 = @intCast(self.settings_row);
-        self.settings_row = @intCast(@mod(r + delta + 4, 4));
+        self.settings_row = @intCast(@mod(r + delta + 7, 7));
     }
 
     pub fn settingsAdjust(self: *Ui, s: *config.Settings, delta: i32) void {
         switch (self.settings_row) {
             0 => {
-                var ri: i32 = @intCast(resIndex(s.width, s.height));
-                ri = @mod(ri + delta + 3, 3);
-                switch (ri) {
-                    0 => {
-                        s.width = 1280;
-                        s.height = 720;
-                    },
-                    1 => {
-                        s.width = 1920;
-                        s.height = 1080;
-                    },
-                    2 => {
-                        s.width = 2560;
-                        s.height = 1440;
-                    },
-                    else => {},
-                }
+                const n: i32 = @intCast(config.quality_options.len);
+                var qi: i32 = @intCast(qualityIndex(s.quality));
+                qi = @mod(qi + delta + n, n);
+                s.quality = config.quality_options[@intCast(qi)].quality_preset;
             },
             1 => {
-                var bi: i32 = @intCast(bwIndex(s.max_bandwidth_kbps));
-                bi = @mod(bi + delta + 5, 5);
-                s.max_bandwidth_kbps = bw_values[@intCast(bi)];
+                const n: i32 = @intCast(config.resolution_options.len);
+                var ri: i32 = @intCast(resIndex(s.width, s.height));
+                ri = @mod(ri + delta + n, n);
+                const opt = config.resolution_options[@intCast(ri)];
+                s.width = opt.width;
+                s.height = opt.height;
             },
             2 => {
-                s.enable_hevc = !s.enable_hevc;
+                const n: i32 = @intCast(config.bandwidth_options.len);
+                var bi: i32 = @intCast(bwIndex(s.max_bandwidth_kbps));
+                bi = @mod(bi + delta + n, n);
+                s.max_bandwidth_kbps = config.bandwidth_options[@intCast(bi)].kbps;
             },
             3 => {
+                const n: i32 = @intCast(config.framerate_options.len);
+                var fi: i32 = @intCast(frIndex(s.framerate_limit));
+                fi = @mod(fi + delta + n, n);
+                s.framerate_limit = config.framerate_options[@intCast(fi)].framerate_numerator;
+            },
+            4 => {
+                const n: i32 = @intCast(config.audio_options.len);
+                var ai: i32 = @intCast(audioIndex(s.audio_channels));
+                ai = @mod(ai + delta + n, n);
+                s.audio_channels = config.audio_options[@intCast(ai)].channels;
+            },
+            5 => {
+                s.enable_hevc = !s.enable_hevc;
+            },
+            6 => {
                 s.hw_decode = !s.hw_decode;
             },
             else => {},
         }
     }
 
+    fn qualityIndex(quality: u32) usize {
+        for (config.quality_options, 0..) |o, i| {
+            if (o.quality_preset == quality) return i;
+        }
+        return 0;
+    }
+
     fn resIndex(w: u32, h: u32) usize {
-        if (w == 1920 and h == 1080) return 1;
-        if (w == 2560 and h == 1440) return 2;
+        for (config.resolution_options, 0..) |o, i| {
+            if (o.width == w and o.height == h) return i;
+        }
         return 0;
     }
 
     fn bwIndex(kbps: u32) usize {
-        for (bw_values, 0..) |v, i| {
-            if (v == kbps) return i;
+        for (config.bandwidth_options, 0..) |o, i| {
+            if (o.kbps == kbps) return i;
         }
-        return bw_values.len - 1;
+        return config.bandwidth_options.len - 1;
+    }
+
+    fn frIndex(framerateNumerator: u32) usize {
+        for (config.framerate_options, 0..) |o, i| {
+            if (o.framerate_numerator == framerateNumerator) return i;
+        }
+        return config.framerate_options.len - 1;
+    }
+
+    fn audioIndex(channels: u32) usize {
+        for (config.audio_options, 0..) |o, i| {
+            if (o.channels == channels) return i;
+        }
+        return config.audio_options.len - 1;
     }
 };

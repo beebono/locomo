@@ -16,12 +16,63 @@ pub const PairedHost = struct {
 };
 
 pub const Settings = struct {
+    quality: u32 = 2,
     width: u32 = 1280,
     height: u32 = 720,
+    audio_channels: u32 = 2,
     max_bandwidth_kbps: u32 = 0,
+    framerate_limit: u32 = 0,
     enable_hevc: bool = false,
     hw_decode: bool = true,
 };
+
+pub const QualityOption = struct { quality_preset: u32, label: [:0]const u8 };
+pub const ResolutionOption = struct { width: u32, height: u32, label: [:0]const u8 };
+pub const BandwidthOption = struct { kbps: u32, label: [:0]const u8 };
+pub const AudioOption = struct { channels: u32, label: [:0]const u8 };
+pub const FramerateOption = struct { framerate_numerator: u32, label: [:0]const u8 };
+
+pub const quality_options = [_]QualityOption{
+    .{ .quality_preset = 1, .label = "Fast" },
+    .{ .quality_preset = 2, .label = "Balanced" },
+    .{ .quality_preset = 3, .label = "Beautiful" },
+};
+
+pub const resolution_options = [_]ResolutionOption{
+    .{ .width = 0, .height = 0, .label = "Native" },
+    .{ .width = 852, .height = 480, .label = "852x480" },
+    .{ .width = 1280, .height = 720, .label = "1280x720" },
+    .{ .width = 1600, .height = 900, .label = "1600x900" },
+    .{ .width = 1920, .height = 1080, .label = "1920x1080" },
+    .{ .width = 2560, .height = 1440, .label = "2560x1440" },
+    .{ .width = 3840, .height = 2160, .label = "3840x2160" },
+};
+
+pub const bandwidth_options = [_]BandwidthOption{
+    .{ .kbps = 5000, .label = "5 Mbps" },
+    .{ .kbps = 10000, .label = "10 Mbps" },
+    .{ .kbps = 15000, .label = "15 Mbps" },
+    .{ .kbps = 20000, .label = "20 Mbps" },
+    .{ .kbps = 30000, .label = "30 Mbps" },
+    .{ .kbps = 50000, .label = "50 Mbps" },
+    .{ .kbps = 100000, .label = "100 Mbps" },
+    .{ .kbps = 0, .label = "Unlimited" },
+};
+
+pub const audio_options = [_]AudioOption{
+    .{ .channels = 0, .label = "No Audio" },
+    .{ .channels = 1, .label = "Mono" },
+    .{ .channels = 2, .label = "Stereo" },
+};
+
+pub const framerate_options = [_]FramerateOption{
+    .{ .framerate_numerator = 3000, .label = "30 FPS" },
+    .{ .framerate_numerator = 6000, .label = "60 FPS" },
+    .{ .framerate_numerator = 12000, .label = "120 FPS" },
+    .{ .framerate_numerator = 24000, .label = "240 FPS" },
+    .{ .framerate_numerator = 0, .label = "Unlimited" },
+};
+pub const framerate_denominator = 100;
 
 const DeviceJson = struct { device_id: u64, secret_key: [32]u8, device_name: []const u8 };
 const PairedJson = struct { hostname: []const u8, client_id: u64, instance_id: u64, steam_id: u64 };

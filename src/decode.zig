@@ -331,6 +331,7 @@ fn videoSetCaptureSize(
     ctx.pending_w.store(alignUp16(@intCast(width)), .release);
     ctx.pending_h.store(alignUp16(@intCast(height)), .release);
     ctx.pending_resize.store(true, .release);
+    ctx.video_lost.store(true, .release);
     ctx.need_keyframe.store(true, .release);
     return 0;
 }
@@ -679,6 +680,7 @@ fn audioStart(
     _ = c.av_opt_set_sample_fmt(swr, "in_sample_fmt", codec_ctx.*.sample_fmt, 0);
     _ = c.av_opt_set_sample_fmt(swr, "out_sample_fmt", c.AV_SAMPLE_FMT_S16, 0);
     if (c.swr_init(swr) < 0) {
+        std.debug.print("[decode] swr_init failed (fmt={d} ch={d}); non-S16 frames will be dropped\n", .{ codec_ctx.*.sample_fmt, cfg.channels });
         c.swr_free(@ptrCast(@constCast(&swr)));
     } else {
         ctx.audio_swr_ctx = swr;
@@ -726,6 +728,8 @@ fn audioSubmit(
             if (frame.*.format == c.AV_SAMPLE_FMT_S16) {
                 const byte_count: usize = @intCast(frame.*.nb_samples * frame.*.ch_layout.nb_channels * @sizeOf(c_short));
                 _ = c.SDL_QueueAudio(ctx.audio_device, &frame.*.data[0], @intCast(byte_count));
+            } else {
+                std.debug.print("[decode] audio frame dropped: no swr ctx and format {d} is not S16\n", .{frame.*.format});
             }
         }
         c.av_frame_unref(frame);

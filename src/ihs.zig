@@ -216,6 +216,7 @@ const StreamArgs = struct {
     pin: [16]u8,
     width: i32,
     height: i32,
+    audio_channels: i32,
 };
 
 fn onStreamProgress(
@@ -277,11 +278,11 @@ fn streamRequestThread(args: StreamArgs) void {
     var req = std.mem.zeroes(c.IHS_StreamingRequest);
     @memcpy(&req.pin, &args.pin);
     req.streamingEnable.video = true;
-    req.streamingEnable.audio = true;
+    req.streamingEnable.audio = args.audio_channels != 0;
     req.streamingEnable.input = true;
     req.maxResolution.x = args.width;
     req.maxResolution.y = args.height;
-    req.audioChannelCount = 2;
+    req.audioChannelCount = args.audio_channels;
     req.streamingInterface = c.IHS_StreamInterfaceBigPicture;
 
     var host = args.host;
@@ -303,7 +304,8 @@ pub fn startStreamRequest(
     pin: [16]u8,
     width: i32,
     height: i32,
+    audio_channels: i32,
 ) !std.Thread {
-    const args = StreamArgs{ .ctx = ctx, .cfg = cfg, .host = host, .pin = pin, .width = width, .height = height };
+    const args = StreamArgs{ .ctx = ctx, .cfg = cfg, .host = host, .pin = pin, .width = width, .height = height, .audio_channels = audio_channels };
     return std.Thread.spawn(.{}, streamRequestThread, .{args});
 }

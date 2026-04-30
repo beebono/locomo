@@ -20,8 +20,9 @@ const Phase = enum {
 const SessionCtx = struct {
     disconnected: std.atomic.Value(bool),
     connected: std.atomic.Value(bool),
-    enable_hevc: bool,
-    max_bandwidth_kbps: u32,
+    settings: *const config.Settings,
+    screen_w: i32,
+    screen_h: i32,
 };
 
 fn onSessionConnected(
@@ -31,6 +32,11 @@ fn onSessionConnected(
     _ = session;
     const ctx: *SessionCtx = @ptrCast(@alignCast(ctx_ptr.?));
     ctx.connected.store(true, .release);
+}
+
+fn effectiveRes(s: *const config.Settings, screen_w: i32, screen_h: i32) struct { w: i32, h: i32 } {
+    if (s.width == 0 or s.height == 0) return .{ .w = screen_w, .h = screen_h };
+    return .{ .w = @intCast(s.width), .h = @intCast(s.height) };
 }
 
 fn logPrint(
@@ -66,10 +72,18 @@ fn onSessionConfiguring(
 ) callconv(.c) void {
     _ = session;
     const ctx: *SessionCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    const s = ctx.settings;
     const cfg = session_config.?;
-    cfg.enableAudio = true;
-    cfg.enableHevc = ctx.enable_hevc;
-    cfg.maxBitrateKbps = ctx.max_bandwidth_kbps;
+    const res = effectiveRes(s, ctx.screen_w, ctx.screen_h);
+    cfg.quality = @intCast(s.quality);
+    cfg.enableAudio = s.audio_channels != 0;
+    cfg.enableHevc = s.enable_hevc;
+    cfg.maxBitrateKbps = @intCast(s.max_bandwidth_kbps);
+    cfg.audioChannels = @intCast(s.audio_channels);
+    cfg.videoWidth = res.w;
+    cfg.videoHeight = res.h;
+    cfg.maxFramerateNumerator = @intCast(s.framerate_limit);
+    cfg.maxFramerateDenominator = if (s.framerate_limit == 0) 0 else @intCast(config.framerate_denominator);
 }
 
 var session_callbacks = c.IHS_StreamSessionCallbacks{
@@ -318,6 +332,8 @@ fn beginStreaming(state: *AppState) !void {
     const host = state.selected_host orelse return error.NoHost;
     const cfg = state.clientConfig();
 
+    const res = effectiveRes(&state.settings, state.ui.logical_w, state.ui.logical_h);
+
     state.ui.drawStatus("Requesting stream...");
     var stream_ctx = ihs.StreamRequestCtx.init();
     const stream_thread = try ihs.startStreamRequest(
@@ -325,8 +341,9 @@ fn beginStreaming(state: *AppState) !void {
         cfg,
         host,
         std.mem.zeroes([16]u8),
-        @intCast(state.settings.width),
-        @intCast(state.settings.height),
+        res.w,
+        res.h,
+        @intCast(state.settings.audio_channels),
     );
     stream_thread.join();
 
@@ -354,8 +371,9 @@ fn beginStreaming(state: *AppState) !void {
     var sess_ctx = SessionCtx{
         .disconnected = std.atomic.Value(bool).init(false),
         .connected = std.atomic.Value(bool).init(false),
-        .enable_hevc = state.settings.enable_hevc,
-        .max_bandwidth_kbps = state.settings.max_bandwidth_kbps,
+        .settings = &state.settings,
+        .screen_w = state.ui.logical_w,
+        .screen_h = state.ui.logical_h,
     };
     c.IHS_SessionSetSessionCallbacks(session, &session_callbacks, &sess_ctx);
     c.IHS_SessionSetVideoCallbacks(session, &decode.video_callbacks, &state.decode_ctx);
@@ -373,6 +391,13 @@ fn beginStreaming(state: *AppState) !void {
     // Host will immediately refuse the connection thinking something went wrong.
     var hid_initialized = false;
     defer if (hid_initialized) input.deinit();
+
+    // Heartbeat to suppress Steam's idle-gamepad timeout when the user is
+    // active but holding a steady state (no deltas to send).
+    const heartbeat_interval_ns: i128 = 30 * std.time.ns_per_s;
+    const recent_input_window_ns: i128 = 30 * std.time.ns_per_s;
+    var last_input_ns: i128 = Io.Clock.awake.now(io).toNanoseconds();
+    var last_heartbeat_ns: i128 = last_input_ns;
 
     var texture: ?*c.SDL_Texture = null;
     var tex_w: u32 = 0;
@@ -392,9 +417,21 @@ fn beginStreaming(state: *AppState) !void {
                 c.IHS_SessionDisconnect(session);
                 break;
             }
-            _ = input.handleEvent(session, &event);
+            if (input.handleEvent(session, &event)) {
+                last_input_ns = Io.Clock.awake.now(io).toNanoseconds();
+            }
         }
         if (state.phase == .quit) break;
+
+        if (hid_initialized) {
+            const now_ns = Io.Clock.awake.now(io).toNanoseconds();
+            if (now_ns - last_heartbeat_ns >= heartbeat_interval_ns) {
+                if (now_ns - last_input_ns <= recent_input_window_ns) {
+                    _ = c.IHS_SessionHIDNotifyDeviceChange(session);
+                }
+                last_heartbeat_ns = now_ns;
+            }
+        }
 
         if (state.decode_ctx.getNextFrame(&frame)) {
             if (texture == null or frame.width != tex_w or frame.height != tex_h) {
@@ -418,8 +455,8 @@ fn beginStreaming(state: *AppState) !void {
             if (texture) |t| {
                 const dst = computeFrameDst(
                     state.ui.renderer,
-                    @intCast(state.settings.width),
-                    @intCast(state.settings.height),
+                    res.w,
+                    res.h,
                     @intCast(frame.width),
                     @intCast(frame.height),
                 );
@@ -434,8 +471,8 @@ fn beginStreaming(state: *AppState) !void {
             if (texture) |t| {
                 const dst = computeFrameDst(
                     state.ui.renderer,
-                    @intCast(state.settings.width),
-                    @intCast(state.settings.height),
+                    res.w,
+                    res.h,
                     @intCast(frame.width),
                     @intCast(frame.height),
                 );
@@ -473,7 +510,7 @@ fn settingsScreen(state: *AppState) void {
             .dpad_up => state.ui.settingsMoveRow(-1),
             .dpad_down => state.ui.settingsMoveRow(1),
             .dpad_left => state.ui.settingsAdjust(&s, -1),
-            .dpad_right => state.ui.settingsAdjust(&s, 1),
+            .dpad_right, .button_a => state.ui.settingsAdjust(&s, 1),
             else => {},
         }
         io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
