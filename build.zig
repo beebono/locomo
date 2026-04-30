@@ -110,7 +110,6 @@ pub fn build(b: *std.Build) void {
     mod.addObjectFile(b.path("libs/lib/libavformat.a"));
     mod.addObjectFile(b.path("libs/lib/libavutil.a"));
     mod.addObjectFile(b.path("libs/lib/libswresample.a"));
-    mod.addObjectFile(b.path("libs/lib/libswscale.a"));
     mod.addObjectFile(b.path("libs/lib/libmbedcrypto.a"));
     mod.addObjectFile(b.path("libs/lib/libprotobuf-c.a"));
 

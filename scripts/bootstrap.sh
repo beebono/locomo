@@ -202,7 +202,9 @@ build_ffmpeg() {
     "$src/configure" \
         --prefix="$LIBS_DIR" --bindir="$BUILD_DIR/ffmpeg-bin" \
         --enable-static --disable-shared \
-        --disable-everything \
+        --disable-doc --disable-programs \
+        --disable-everything --disable-swscale \
+        --disable-avdevice --disable-avfilter \
         --enable-protocol=rtp --enable-protocol=udp --enable-protocol=tcp \
         --enable-demuxer=rtsp --enable-demuxer=rtp \
         --enable-demuxer=h264 --enable-demuxer=hevc \
@@ -214,8 +216,6 @@ build_ffmpeg() {
         --enable-decoder=aac --enable-decoder=opus \
         --enable-v4l2-m2m --enable-rkmpp \
         --enable-libdrm --enable-version3 \
-        --disable-avdevice --disable-avfilter \
-        --disable-doc --disable-programs \
         --enable-pic --enable-optimizations \
         --extra-cflags="-I$LIBS_DIR/include" --extra-ldflags="-L$LIBS_DIR/lib" \
         "${cross_prefix_flags[@]+"${cross_prefix_flags[@]}"}"

@@ -12,6 +12,5 @@ pub const c = @cImport({
     @cInclude("libavutil/frame.h");
     @cInclude("libavutil/imgutils.h");
     @cInclude("libavutil/opt.h");
-    @cInclude("libswscale/swscale.h");
     @cInclude("libswresample/swresample.h");
 });
