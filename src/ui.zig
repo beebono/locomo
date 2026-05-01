@@ -293,7 +293,7 @@ pub const Ui = struct {
         self.clear();
         self.renderTextCentered("Settings", @divTrunc(self.logical_h, 12), COLOR_FG, self.font);
 
-        const rows = [_][:0]const u8{ "Quality Preset", "Resolution", "Bandwidth Limit", "Framerate Limit", "Audio Type", "H.265 / HEVC", "HW Decode" };
+        const rows = [_][:0]const u8{ "Quality Preset", "Resolution", "Bandwidth Limit", "Framerate Limit", "Audio Type", "H.265 / HEVC (WIP)", "HW Decode" };
         const start_y: i32 = @divTrunc(self.logical_h, 9) * 2;
         const row_h: i32 = @divTrunc(self.logical_h, 12);
 
@@ -399,7 +399,7 @@ pub const Ui = struct {
         for (config.quality_options, 0..) |o, i| {
             if (o.quality_preset == quality) return i;
         }
-        return 0;
+        return 1;
     }
 
     fn resIndex(w: u32, h: u32) usize {
@@ -409,18 +409,18 @@ pub const Ui = struct {
         return 0;
     }
 
-    fn bwIndex(kbps: u32) usize {
+    fn bwIndex(kbps: i32) usize {
         for (config.bandwidth_options, 0..) |o, i| {
             if (o.kbps == kbps) return i;
         }
-        return config.bandwidth_options.len - 1;
+        return 0;
     }
 
     fn frIndex(framerateNumerator: u32) usize {
         for (config.framerate_options, 0..) |o, i| {
             if (o.framerate_numerator == framerateNumerator) return i;
         }
-        return config.framerate_options.len - 1;
+        return 0;
     }
 
     fn audioIndex(channels: u32) usize {

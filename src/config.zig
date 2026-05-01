@@ -17,10 +17,10 @@ pub const PairedHost = struct {
 
 pub const Settings = struct {
     quality: u32 = 2,
-    width: u32 = 1280,
-    height: u32 = 720,
+    width: u32 = 0,
+    height: u32 = 0,
     audio_channels: u32 = 2,
-    max_bandwidth_kbps: u32 = 0,
+    max_bandwidth_kbps: i32 = -1,
     framerate_limit: u32 = 0,
     enable_hevc: bool = false,
     hw_decode: bool = true,
@@ -28,7 +28,7 @@ pub const Settings = struct {
 
 pub const QualityOption = struct { quality_preset: u32, label: [:0]const u8 };
 pub const ResolutionOption = struct { width: u32, height: u32, label: [:0]const u8 };
-pub const BandwidthOption = struct { kbps: u32, label: [:0]const u8 };
+pub const BandwidthOption = struct { kbps: i32, label: [:0]const u8 };
 pub const AudioOption = struct { channels: u32, label: [:0]const u8 };
 pub const FramerateOption = struct { framerate_numerator: u32, label: [:0]const u8 };
 
@@ -49,6 +49,7 @@ pub const resolution_options = [_]ResolutionOption{
 };
 
 pub const bandwidth_options = [_]BandwidthOption{
+    .{ .kbps = -1, .label = "Automatic" },
     .{ .kbps = 5000, .label = "5 Mbps" },
     .{ .kbps = 10000, .label = "10 Mbps" },
     .{ .kbps = 15000, .label = "15 Mbps" },
@@ -66,11 +67,11 @@ pub const audio_options = [_]AudioOption{
 };
 
 pub const framerate_options = [_]FramerateOption{
+    .{ .framerate_numerator = 0, .label = "Automatic" },
     .{ .framerate_numerator = 3000, .label = "30 FPS" },
     .{ .framerate_numerator = 6000, .label = "60 FPS" },
     .{ .framerate_numerator = 12000, .label = "120 FPS" },
     .{ .framerate_numerator = 24000, .label = "240 FPS" },
-    .{ .framerate_numerator = 0, .label = "Unlimited" },
 };
 pub const framerate_denominator = 100;
 
@@ -221,7 +222,11 @@ pub fn loadSettings(allocator: std.mem.Allocator) !Settings {
     defer file.close(io);
     const data = readFileToEnd(allocator, file) catch return Settings{};
     defer allocator.free(data);
-    const parsed = std.json.parseFromSlice(Settings, allocator, data, .{}) catch return Settings{};
+    const parsed = std.json.parseFromSlice(Settings, allocator, data, .{}) catch {
+        const defaults = Settings{};
+        saveSettings(allocator, defaults) catch {};
+        return defaults;
+    };
     defer parsed.deinit();
     return parsed.value;
 }

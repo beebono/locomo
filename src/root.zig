@@ -45,9 +45,9 @@ fn logPrint(
     message: [*c]const u8,
 ) callconv(.c) void {
     // IHS log levels are listed backwards in the enum
-    // so anything greater than Info is more verbose
-    // rather than less, ignore them to reduce noise
-    if (level > c.IHS_LogLevelInfo) return;
+    // so anything greater than is more verbose
+    // rather than less, ignore to reduce noise
+    if (level > c.IHS_LogLevelWarn) return;
     const level_name = c.IHS_LogLevelName(level);
     std.debug.print("[IHS.{s} {s}] {s}\n", .{
         std.mem.span(tag),

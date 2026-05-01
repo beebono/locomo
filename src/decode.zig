@@ -132,8 +132,7 @@ pub const DecodeCtx = struct {
     audio_codec_ctx: ?*c.AVCodecContext,
     audio_swr_ctx: ?*c.SwrContext,
     audio_device: c.SDL_AudioDeviceID,
-    audio_resample_buf: [*c]u8,
-    audio_resample_buf_size: c_int,
+    audio_max_queue_bytes: u32,
 
     pub fn init(allocator: std.mem.Allocator, hw_decode: bool) DecodeCtx {
         return .{
@@ -162,8 +161,7 @@ pub const DecodeCtx = struct {
             .audio_codec_ctx = null,
             .audio_swr_ctx = null,
             .audio_device = 0,
-            .audio_resample_buf = null,
-            .audio_resample_buf_size = 0,
+            .audio_max_queue_bytes = 0,
         };
     }
 
@@ -185,9 +183,6 @@ pub const DecodeCtx = struct {
         if (self.video_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
         if (self.audio_swr_ctx) |s| c.swr_free(@ptrCast(@constCast(&s)));
         if (self.audio_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
-        if (self.audio_resample_buf != null) {
-            _ = c.av_free(self.audio_resample_buf);
-        }
     }
 
     pub fn getNextFrame(self: *DecodeCtx, out: *VideoFrame) bool {
@@ -259,13 +254,10 @@ fn selectCodec(codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extra
     if (hw_decode) {
         for (hw_candidates) |cand| {
             if (openCandidate(w, h, extradata, cand.name, cand.hw_type)) |cc| {
-                std.debug.print("[decode] using {s} ({d}x{d})\n", .{ cand.name, w, h });
                 return cc;
             }
         }
-        std.debug.print("[decode] no HW decoder available, falling back to SW\n", .{});
-    } else {
-        std.debug.print("[decode] using SW decoder (hw_decode=off)\n", .{});
+        std.debug.print("[decode] No HW decoder available, falling back to SW\n", .{});
     }
     return openSoftware(w, h, extradata, codec_id);
 }
@@ -353,7 +345,6 @@ fn videoSubmit(
 
     if (ctx.need_keyframe.load(.acquire)) {
         if (!is_keyframe) {
-            std.debug.print("[decode] need_keyframe set, but didn't get a keyframe!\n", .{});
             return c.IHS_StreamVideoSubmitReportLost;
         }
         ctx.need_keyframe.store(false, .release);
@@ -362,7 +353,6 @@ fn videoSubmit(
     if (!ring.tryPush(data_ptr[0..data_len], is_keyframe)) {
         ctx.video_lost.store(true, .release);
         ctx.need_keyframe.store(true, .release);
-        std.debug.print("[decode] Couldn't push to decoder, requesting a keyframe!\n", .{});
         return c.IHS_StreamVideoSubmitReportLost;
     }
     return c.IHS_StreamVideoSubmitOK;
@@ -434,7 +424,6 @@ fn drainDecoder(ctx: *DecodeCtx) bool {
                 }
             },
             else => {
-                std.debug.print("[decode] unsupported pixel format {d}\n", .{src.format});
                 ctx.allocator.free(plane_y);
                 continue;
             },
@@ -520,7 +509,6 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
                 const new_w = ctx.pending_w.load(.acquire);
                 const new_h = ctx.pending_h.load(.acquire);
                 if (new_w != ctx.req_w or new_h != ctx.req_h) {
-                    std.debug.print("[decode] reinit codec for resize {d}x{d}\n", .{ new_w, new_h });
                     if (!rebuildCodec(ctx, new_w, new_h)) {
                         ctx.need_keyframe.store(true, .release);
                         continue;
@@ -552,8 +540,7 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
                 const drained = drainDecoder(ctx);
                 if (!drained) {
                     eagain_retries += 1;
-                    if (eagain_retries > 4) {
-                        std.debug.print("[decode] EAGAIN stuck, forcing rebuild\n", .{});
+                    if (eagain_retries > 2) {
                         const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
                         const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
                         _ = rebuildCodec(ctx, fb_w, fb_h);
@@ -568,7 +555,6 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
             }
             const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
             const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
-            std.debug.print("[decode] send_packet failed (ret={d}), rebuilding at {d}x{d}\n", .{ ret, fb_w, fb_h });
             _ = rebuildCodec(ctx, fb_w, fb_h);
             waiting_for_keyframe = true;
             ctx.need_keyframe.store(true, .release);
@@ -657,7 +643,10 @@ fn audioStart(
     want.freq = @intCast(cfg.frequency);
     want.format = c.AUDIO_S16SYS;
     want.channels = 2;
-    want.samples = 1024;
+    want.samples = 512;
+
+    // Prevent audio from queueing up too much
+    ctx.audio_max_queue_bytes = @intCast((cfg.frequency * 4 * 80) / 1000);
 
     ctx.audio_device = c.SDL_OpenAudioDevice(null, 0, &want, null, 0);
     if (ctx.audio_device == 0) {
@@ -680,7 +669,6 @@ fn audioStart(
     _ = c.av_opt_set_sample_fmt(swr, "in_sample_fmt", codec_ctx.*.sample_fmt, 0);
     _ = c.av_opt_set_sample_fmt(swr, "out_sample_fmt", c.AV_SAMPLE_FMT_S16, 0);
     if (c.swr_init(swr) < 0) {
-        std.debug.print("[decode] swr_init failed (fmt={d} ch={d}); non-S16 frames will be dropped\n", .{ codec_ctx.*.sample_fmt, cfg.channels });
         c.swr_free(@ptrCast(@constCast(&swr)));
     } else {
         ctx.audio_swr_ctx = swr;
@@ -712,6 +700,10 @@ fn audioSubmit(
     defer c.av_frame_free(@ptrCast(@constCast(&frame)));
 
     while (c.avcodec_receive_frame(codec_ctx, frame) == 0) {
+        // If the queue has grown past the cap, drop it to resync to "now".
+        if (c.SDL_GetQueuedAudioSize(ctx.audio_device) > ctx.audio_max_queue_bytes) {
+            c.SDL_ClearQueuedAudio(ctx.audio_device);
+        }
         if (ctx.audio_swr_ctx) |swr| {
             const out_samples = c.swr_get_out_samples(swr, frame.*.nb_samples);
             var out_buf: [*c]u8 = null;
@@ -728,8 +720,6 @@ fn audioSubmit(
             if (frame.*.format == c.AV_SAMPLE_FMT_S16) {
                 const byte_count: usize = @intCast(frame.*.nb_samples * frame.*.ch_layout.nb_channels * @sizeOf(c_short));
                 _ = c.SDL_QueueAudio(ctx.audio_device, &frame.*.data[0], @intCast(byte_count));
-            } else {
-                std.debug.print("[decode] audio frame dropped: no swr ctx and format {d} is not S16\n", .{frame.*.format});
             }
         }
         c.av_frame_unref(frame);
