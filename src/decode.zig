@@ -69,7 +69,7 @@ const PacketRing = struct {
         while (self.count == 0 and !self.shutdown) {
             self.not_empty.waitUncancelable(io, &self.mutex);
         }
-        if (self.count == 0) return null;
+        if (self.count == 0 or self.shutdown) return null;
         const slot = &self.slots[self.tail];
         const n = slot.len;
         @memcpy(dst[0..n], slot.data[0..n]);
@@ -119,7 +119,9 @@ pub const DecodeCtx = struct {
     av_frame: ?*c.AVFrame,
     av_sw_frame: ?*c.AVFrame,
     pending_frame: ?VideoFrame,
-    frame_ready: std.atomic.Value(bool),
+    frame_ready: bool,
+    frame_mutex: std.Io.Mutex,
+    frame_event: std.Io.Event,
     video_ring: ?PacketRing,
     video_thread: ?std.Thread,
     video_lost: std.atomic.Value(bool),
@@ -127,6 +129,8 @@ pub const DecodeCtx = struct {
     pending_resize: std.atomic.Value(bool),
     pending_w: std.atomic.Value(i32),
     pending_h: std.atomic.Value(i32),
+    force_disconnect: std.atomic.Value(bool),
+    submit_stuck_since_ms: i64,
 
     // Audio
     audio_codec_ctx: ?*c.AVCodecContext,
@@ -150,7 +154,9 @@ pub const DecodeCtx = struct {
             .av_frame = null,
             .av_sw_frame = null,
             .pending_frame = null,
-            .frame_ready = std.atomic.Value(bool).init(false),
+            .frame_ready = false,
+            .frame_mutex = .init,
+            .frame_event = .unset,
             .video_ring = null,
             .video_thread = null,
             .video_lost = std.atomic.Value(bool).init(false),
@@ -158,6 +164,8 @@ pub const DecodeCtx = struct {
             .pending_resize = std.atomic.Value(bool).init(false),
             .pending_w = std.atomic.Value(i32).init(0),
             .pending_h = std.atomic.Value(i32).init(0),
+            .force_disconnect = std.atomic.Value(bool).init(false),
+            .submit_stuck_since_ms = 0,
             .audio_codec_ctx = null,
             .audio_swr_ctx = null,
             .audio_device = 0,
@@ -185,11 +193,16 @@ pub const DecodeCtx = struct {
         if (self.audio_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
     }
 
-    pub fn getNextFrame(self: *DecodeCtx, out: *VideoFrame) bool {
-        if (!self.frame_ready.load(.acquire)) return false;
+    pub fn waitNextFrame(self: *DecodeCtx, out: *VideoFrame, timeout: std.Io.Timeout) bool {
+        self.frame_event.waitTimeout(io, timeout) catch {};
+        self.frame_event.reset();
+
+        self.frame_mutex.lockUncancelable(io);
+        defer self.frame_mutex.unlock(io);
+        if (!self.frame_ready) return false;
         out.* = self.pending_frame.?;
         self.pending_frame = null;
-        self.frame_ready.store(false, .release);
+        self.frame_ready = false;
         return true;
     }
 };
@@ -211,6 +224,7 @@ fn openCandidate(w: c_int, h: c_int, extradata: ?[]const u8, name: [*:0]const u8
     const cc = c.avcodec_alloc_context3(codec) orelse return null;
     cc.*.width = w;
     cc.*.height = h;
+    cc.*.flags |= c.AV_CODEC_FLAG_LOW_DELAY;
     applyExtradata(cc, extradata);
     if (hw_type != c.AV_HWDEVICE_TYPE_NONE) {
         if (c.av_hwdevice_ctx_create(&cc.*.hw_device_ctx, hw_type, null, null, 0) < 0) {
@@ -230,6 +244,7 @@ fn openSoftware(w: c_int, h: c_int, extradata: ?[]const u8, codec_id: c.AVCodecI
     const cc = c.avcodec_alloc_context3(codec) orelse return null;
     cc.*.width = w;
     cc.*.height = h;
+    cc.*.flags |= c.AV_CODEC_FLAG_LOW_DELAY;
     applyExtradata(cc, extradata);
     if (c.avcodec_open2(cc, codec, null) < 0) {
         c.avcodec_free_context(@ptrCast(@constCast(&cc)));
@@ -343,8 +358,22 @@ fn videoSubmit(
     const data_len = buf.size;
     const is_keyframe = (flags & c.IHS_StreamVideoFrameKeyFrame) != 0;
 
+    const failsafe_ms: i64 = 1000;
+    const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+
+    const tripFailsafe = struct {
+        fn call(c_ctx: *DecodeCtx, now: i64) bool {
+            if (c_ctx.submit_stuck_since_ms == 0) {
+                c_ctx.submit_stuck_since_ms = now;
+                return false;
+            }
+            return now - c_ctx.submit_stuck_since_ms > failsafe_ms;
+        }
+    }.call;
+
     if (ctx.need_keyframe.load(.acquire)) {
         if (!is_keyframe) {
+            if (tripFailsafe(ctx, now_ms)) ctx.force_disconnect.store(true, .release);
             return c.IHS_StreamVideoSubmitReportLost;
         }
         ctx.need_keyframe.store(false, .release);
@@ -353,118 +382,122 @@ fn videoSubmit(
     if (!ring.tryPush(data_ptr[0..data_len], is_keyframe)) {
         ctx.video_lost.store(true, .release);
         ctx.need_keyframe.store(true, .release);
+        if (tripFailsafe(ctx, now_ms)) ctx.force_disconnect.store(true, .release);
         return c.IHS_StreamVideoSubmitReportLost;
     }
+
+    ctx.submit_stuck_since_ms = 0;
     return c.IHS_StreamVideoSubmitOK;
 }
 
-fn drainDecoder(ctx: *DecodeCtx) bool {
-    const codec_ctx = ctx.video_codec_ctx orelse return false;
-    const av_frame = ctx.av_frame orelse return false;
-    const sw_frame = ctx.av_sw_frame orelse return false;
+fn populateFrame(ctx: *DecodeCtx) void {
+    const av_frame = ctx.av_frame orelse return;
+    const sw_frame = ctx.av_sw_frame orelse return;
+    defer c.av_frame_unref(av_frame);
 
-    var produced = false;
-    while (true) {
-        const ret = c.avcodec_receive_frame(codec_ctx, av_frame);
-        if (ret != 0) break;
-        defer c.av_frame_unref(av_frame);
-        produced = true;
-
-        const is_hw = av_frame.hw_frames_ctx != null;
-        if (is_hw) {
-            c.av_frame_unref(sw_frame);
-            if (c.av_hwframe_transfer_data(sw_frame, av_frame, 0) < 0) continue;
-        }
-        const src: *c.AVFrame = if (is_hw) sw_frame else av_frame;
-        defer if (is_hw) c.av_frame_unref(sw_frame);
-
-        const w = src.width;
-        const h = src.height;
-
-        const uv_h = @divTrunc(h, 2);
-        const y_stride = src.linesize[0];
-        const y_sz: usize = @intCast(y_stride * h);
-
-        const plane_y = ctx.allocator.alloc(u8, y_sz) catch continue;
-        @memcpy(plane_y, src.data[0][0..y_sz]);
-
-        var uv_stride: c_int = 0;
-        var plane_uv: []u8 = undefined;
-        switch (src.format) {
-            c.AV_PIX_FMT_NV12 => {
-                uv_stride = src.linesize[1];
-                const uv_sz: usize = @intCast(uv_stride * uv_h);
-                plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
-                    ctx.allocator.free(plane_y);
-                    continue;
-                };
-                @memcpy(plane_uv, src.data[1][0..uv_sz]);
-            },
-            c.AV_PIX_FMT_YUV420P => {
-                uv_stride = w;
-                const uv_sz: usize = @intCast(uv_stride * uv_h);
-                plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
-                    ctx.allocator.free(plane_y);
-                    continue;
-                };
-                const u_stride: usize = @intCast(src.linesize[1]);
-                const v_stride: usize = @intCast(src.linesize[2]);
-                const half_w: usize = @intCast(@divTrunc(w, 2));
-                const dst_stride: usize = @intCast(uv_stride);
-                var row: usize = 0;
-                while (row < @as(usize, @intCast(uv_h))) : (row += 1) {
-                    const u_row = src.data[1][row * u_stride ..];
-                    const v_row = src.data[2][row * v_stride ..];
-                    const dst = plane_uv[row * dst_stride ..];
-                    var col: usize = 0;
-                    while (col < half_w) : (col += 1) {
-                        dst[col * 2] = u_row[col];
-                        dst[col * 2 + 1] = v_row[col];
-                    }
-                }
-            },
-            else => {
-                ctx.allocator.free(plane_y);
-                continue;
-            },
-        }
-
-        const new_frame = VideoFrame{
-            .y = plane_y,
-            .uv = plane_uv,
-            .width = @intCast(w),
-            .height = @intCast(h),
-            .y_stride = y_stride,
-            .uv_stride = uv_stride,
-            .allocator = ctx.allocator,
-        };
-
-        if (ctx.frame_ready.load(.acquire)) {
-            ctx.allocator.free(new_frame.y);
-            ctx.allocator.free(new_frame.uv);
-        } else {
-            ctx.pending_frame = new_frame;
-            ctx.frame_ready.store(true, .release);
-        }
+    const is_hw = av_frame.hw_frames_ctx != null;
+    if (is_hw) {
+        c.av_frame_unref(sw_frame);
+        if (c.av_hwframe_transfer_data(sw_frame, av_frame, 0) < 0) return;
     }
-    return produced;
+    const src: *c.AVFrame = if (is_hw) sw_frame else av_frame;
+    defer if (is_hw) c.av_frame_unref(sw_frame);
+
+    const w = src.width;
+    const h = src.height;
+
+    const uv_h = @divTrunc(h, 2);
+    const y_stride = src.linesize[0];
+    const y_sz: usize = @intCast(y_stride * h);
+
+    const plane_y = ctx.allocator.alloc(u8, y_sz) catch return;
+    @memcpy(plane_y, src.data[0][0..y_sz]);
+
+    var uv_stride: c_int = 0;
+    var plane_uv: []u8 = undefined;
+    switch (src.format) {
+        c.AV_PIX_FMT_NV12 => {
+            uv_stride = src.linesize[1];
+            const uv_sz: usize = @intCast(uv_stride * uv_h);
+            plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
+                ctx.allocator.free(plane_y);
+                return;
+            };
+            @memcpy(plane_uv, src.data[1][0..uv_sz]);
+        },
+        c.AV_PIX_FMT_YUV420P => {
+            uv_stride = w;
+            const uv_sz: usize = @intCast(uv_stride * uv_h);
+            plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
+                ctx.allocator.free(plane_y);
+                return;
+            };
+            const u_stride: usize = @intCast(src.linesize[1]);
+            const v_stride: usize = @intCast(src.linesize[2]);
+            const half_w: usize = @intCast(@divTrunc(w, 2));
+            const dst_stride: usize = @intCast(uv_stride);
+            var row: usize = 0;
+            while (row < @as(usize, @intCast(uv_h))) : (row += 1) {
+                const u_row = src.data[1][row * u_stride ..];
+                const v_row = src.data[2][row * v_stride ..];
+                const dst = plane_uv[row * dst_stride ..];
+                var col: usize = 0;
+                while (col < half_w) : (col += 1) {
+                    dst[col * 2] = u_row[col];
+                    dst[col * 2 + 1] = v_row[col];
+                }
+            }
+        },
+        else => {
+            ctx.allocator.free(plane_y);
+            return;
+        },
+    }
+
+    // Don't allow garbage frames to render
+    if (std.mem.allEqual(u8, plane_uv, 0)) {
+        ctx.allocator.free(plane_y);
+        ctx.allocator.free(plane_uv);
+        return;
+    }
+
+    const new_frame = VideoFrame{
+        .y = plane_y,
+        .uv = plane_uv,
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .y_stride = y_stride,
+        .uv_stride = uv_stride,
+        .allocator = ctx.allocator,
+    };
+
+    {
+        ctx.frame_mutex.lockUncancelable(io);
+        defer ctx.frame_mutex.unlock(io);
+        if (ctx.frame_ready) {
+            if (ctx.pending_frame) |*old| old.deinit();
+            ctx.pending_frame = null;
+        }
+        ctx.pending_frame = new_frame;
+        ctx.frame_ready = true;
+    }
+    ctx.frame_event.set(io);
 }
 
-fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) bool {
+fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
     if (ctx.video_codec_ctx) |old| {
         _ = c.avcodec_send_packet(old, null);
-        _ = drainDecoder(ctx);
+        _ = c.avcodec_receive_frame(old, ctx.av_frame);
         var old_mut: ?*c.AVCodecContext = old;
         c.avcodec_free_context(&old_mut);
     }
     ctx.video_codec_ctx = null;
     const aligned_w = alignUp16(@intCast(w));
     const aligned_h = alignUp16(@intCast(h));
-    const cc = selectCodec(ctx.codec_id, ctx.hw_decode, aligned_w, aligned_h, null) orelse return false;
+    const cc = selectCodec(ctx.codec_id, ctx.hw_decode, aligned_w, aligned_h, null) orelse return;
     ctx.video_codec_ctx = cc;
     ctx.req_w = aligned_w;
     ctx.req_h = aligned_h;
-    return true;
 }
 
 fn videoDecodeThread(ctx: *DecodeCtx) void {
@@ -475,7 +508,7 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
 
     var waiting_for_keyframe = true;
 
-    while (true) {
+    while (!ctx.force_disconnect.load(.acquire)) {
         var is_keyframe: bool = false;
         const n = ring.pop(scratch, &is_keyframe) orelse return;
 
@@ -509,10 +542,9 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
                 const new_w = ctx.pending_w.load(.acquire);
                 const new_h = ctx.pending_h.load(.acquire);
                 if (new_w != ctx.req_w or new_h != ctx.req_h) {
-                    if (!rebuildCodec(ctx, new_w, new_h)) {
-                        ctx.need_keyframe.store(true, .release);
-                        continue;
-                    }
+                    rebuildCodec(ctx, new_w, new_h);
+                    ctx.need_keyframe.store(true, .release);
+                    continue;
                 } else if (ctx.video_codec_ctx) |cc| {
                     c.avcodec_flush_buffers(cc);
                 }
@@ -531,37 +563,29 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
         @memcpy(pkt.*.data[0..n], scratch[0..n]);
         if (is_keyframe) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
 
-        const eagain: c_int = -@as(c_int, @intCast(c.EAGAIN));
-        var eagain_retries: u32 = 0;
-        send: while (true) {
-            const ret = c.avcodec_send_packet(codec_ctx, pkt);
-            if (ret == 0) break :send;
-            if (ret == eagain) {
-                const drained = drainDecoder(ctx);
-                if (!drained) {
-                    eagain_retries += 1;
-                    if (eagain_retries > 2) {
-                        const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
-                        const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
-                        _ = rebuildCodec(ctx, fb_w, fb_h);
-                        waiting_for_keyframe = true;
-                        ctx.need_keyframe.store(true, .release);
-                        break :send;
-                    }
-                } else {
-                    eagain_retries = 0;
-                }
-                continue;
-            }
+        if (c.avcodec_send_packet(codec_ctx, pkt) != 0) {
             const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
             const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
-            _ = rebuildCodec(ctx, fb_w, fb_h);
+            rebuildCodec(ctx, fb_w, fb_h);
             waiting_for_keyframe = true;
             ctx.need_keyframe.store(true, .release);
-            break :send;
+            continue;
         }
 
-        _ = drainDecoder(ctx);
+        while (!ctx.force_disconnect.load(.acquire)) {
+            const r = c.avcodec_receive_frame(codec_ctx, ctx.av_frame);
+            if (r == 0) {
+                populateFrame(ctx);
+                break;
+            }
+            if (r == c.AVERROR(c.EAGAIN) or r == c.AVERROR_EOF) break;
+            const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
+            const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
+            rebuildCodec(ctx, fb_w, fb_h);
+            waiting_for_keyframe = true;
+            ctx.need_keyframe.store(true, .release);
+            break;
+        }
     }
 }
 

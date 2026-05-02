@@ -174,11 +174,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
         switch (state.phase) {
             .scan => scanForHosts(&state),
             .pair => pairWithPin(&state) catch |err| {
-                std.log.err("pair error: {}", .{err});
+                std.log.err("Pairing reported error: {}", .{err});
                 state.phase = .scan;
             },
             .streaming => beginStreaming(&state) catch |err| {
-                std.log.err("streaming error: {}", .{err});
+                std.log.err("Stream reported error: {}", .{err});
                 state.phase = .disconnected;
             },
             .disconnected => {
@@ -199,10 +199,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
 fn scanForHosts(state: *AppState) void {
     state.ui.host_cursor = 0;
-
     const cfg = state.clientConfig();
-    const paired_client_id: u64 = if (state.paired) |p| p.client_id else 0;
-
     var disc_ctx = ihs.DiscoveryCtx.init(state.allocator);
     defer disc_ctx.deinit();
 
@@ -218,7 +215,7 @@ fn scanForHosts(state: *AppState) void {
         defer if (hosts.len > 0) state.allocator.free(hosts);
 
         const scanning = !disc_ctx.done.load(.acquire);
-        state.ui.drawScanScreen(hosts, paired_client_id, scanning);
+        state.ui.drawScanScreen(hosts, scanning);
 
         const ev = state.ui.pollEvents();
         switch (ev) {
@@ -331,6 +328,7 @@ fn pairWithPin(state: *AppState) !void {
 fn beginStreaming(state: *AppState) !void {
     const host = state.selected_host orelse return error.NoHost;
     const cfg = state.clientConfig();
+    state.decode_ctx.force_disconnect.store(false, .release);
 
     const res = effectiveRes(&state.settings, state.ui.logical_w, state.ui.logical_h);
 
@@ -375,9 +373,13 @@ fn beginStreaming(state: *AppState) !void {
         .screen_w = state.ui.logical_w,
         .screen_h = state.ui.logical_h,
     };
+    var cursor_state = input.CursorState.init(state.allocator);
+    defer cursor_state.deinit();
+
     c.IHS_SessionSetSessionCallbacks(session, &session_callbacks, &sess_ctx);
     c.IHS_SessionSetVideoCallbacks(session, &decode.video_callbacks, &state.decode_ctx);
     c.IHS_SessionSetAudioCallbacks(session, &decode.audio_callbacks, &state.decode_ctx);
+    c.IHS_SessionSetInputCallbacks(session, &input.cursor_callbacks, &cursor_state);
 
     state.ui.drawStatus("Connecting...");
     if (!c.IHS_SessionConnect(session)) {
@@ -404,6 +406,16 @@ fn beginStreaming(state: *AppState) !void {
     var tex_h: u32 = 0;
     defer if (texture) |t| c.SDL_DestroyTexture(t);
 
+    var chords: input.ChordTracker = .{};
+    var mouse_state: input.MouseState = .{};
+    var mouse_mode: bool = false;
+
+    const toast_duration_ns: i128 = 4 * std.time.ns_per_s;
+    const toast1_until_ns: i128 = Io.Clock.awake.now(io).toNanoseconds() + toast_duration_ns;
+    const toast2_until_ns: i128 = Io.Clock.awake.now(io).toNanoseconds() + (toast_duration_ns * 2);
+    const toast_text_tip1: [:0]const u8 = "Hold Start + Select and double-tap West Button to disconnect";
+    const toast_text_tip2: [:0]const u8 = "Hold Start + Select and click Left Stick to toggle mouse mode";
+
     var frame: decode.VideoFrame = undefined;
     while (!sess_ctx.disconnected.load(.acquire)) {
         if (!hid_initialized and sess_ctx.connected.load(.acquire)) {
@@ -417,11 +429,30 @@ fn beginStreaming(state: *AppState) !void {
                 c.IHS_SessionDisconnect(session);
                 break;
             }
+            if (chords.observe(&event)) |action| switch (action) {
+                .disconnect => {
+                    c.IHS_SessionDisconnect(session);
+                    break;
+                },
+                .toggle_mouse => {
+                    mouse_mode = !mouse_mode;
+                    mouse_state.reset(session);
+                },
+            };
+            if (mouse_mode) mouse_state.observe(session, &event);
+            if (mouse_mode and input.MouseState.isMouseModeAxisEvent(&event)) {
+                continue;
+            }
             if (input.handleEvent(session, &event)) {
                 last_input_ns = Io.Clock.awake.now(io).toNanoseconds();
             }
         }
-        if (state.phase == .quit) break;
+
+        if (state.phase == .quit or state.decode_ctx.force_disconnect.load(.acquire)) break;
+
+        if (mouse_mode) {
+            mouse_state.tick(session, &cursor_state, state.ui.logical_w, state.ui.logical_h, Io.Clock.awake.now(io).toNanoseconds());
+        }
 
         if (hid_initialized) {
             const now_ns = Io.Clock.awake.now(io).toNanoseconds();
@@ -433,7 +464,8 @@ fn beginStreaming(state: *AppState) !void {
             }
         }
 
-        if (state.decode_ctx.getNextFrame(&frame)) {
+        const got_frame = state.decode_ctx.waitNextFrame(&frame, .{ .duration = .{ .raw = .fromMilliseconds(8), .clock = .awake } });
+        if (got_frame) {
             if (texture == null or frame.width != tex_w or frame.height != tex_h) {
                 if (texture) |t| c.SDL_DestroyTexture(t);
                 texture = c.SDL_CreateTexture(
@@ -446,6 +478,7 @@ fn beginStreaming(state: *AppState) !void {
                 tex_w = frame.width;
                 tex_h = frame.height;
             }
+
             if (texture) |t| {
                 _ = c.SDL_UpdateNVTexture(t, null, frame.y.ptr, frame.y_stride, frame.uv.ptr, frame.uv_stride);
             }
@@ -462,29 +495,21 @@ fn beginStreaming(state: *AppState) !void {
                 );
                 _ = c.SDL_RenderCopy(state.ui.renderer, t, null, &dst);
             }
+            cursor_state.render(state.ui.renderer, state.ui.logical_w, state.ui.logical_h, mouse_mode);
+            if (Io.Clock.awake.now(io).toNanoseconds() < toast1_until_ns) {
+                state.ui.drawToast(toast_text_tip1);
+            } else if (Io.Clock.awake.now(io).toNanoseconds() < toast2_until_ns) {
+                state.ui.drawToast(toast_text_tip2);
+            }
+
             c.SDL_RenderPresent(state.ui.renderer);
 
             frame.deinit();
-        } else {
-            _ = c.SDL_SetRenderDrawColor(state.ui.renderer, 0, 0, 0, 255);
-            _ = c.SDL_RenderClear(state.ui.renderer);
-            if (texture) |t| {
-                const dst = computeFrameDst(
-                    state.ui.renderer,
-                    res.w,
-                    res.h,
-                    @intCast(frame.width),
-                    @intCast(frame.height),
-                );
-                _ = c.SDL_RenderCopy(state.ui.renderer, t, null, &dst);
-            }
-            c.SDL_RenderPresent(state.ui.renderer);
         }
     }
 
     c.IHS_SessionDisconnect(session);
     c.IHS_SessionThreadedJoin(session);
-
     if (state.phase != .quit) state.phase = .disconnected;
 }
 

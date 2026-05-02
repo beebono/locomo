@@ -172,6 +172,21 @@ pub const Ui = struct {
         _ = c.SDL_RenderFillRect(self.renderer, &r);
     }
 
+    pub fn drawToast(self: *Ui, text: [:0]const u8) void {
+        var tw: c_int = 0;
+        var th: c_int = 0;
+        _ = c.TTF_SizeUTF8(self.font_small, text.ptr, &tw, &th);
+        const pad_x: c_int = 24;
+        const pad_y: c_int = 12;
+        const box_w = tw + pad_x * 2;
+        const box_h = th + pad_y * 2;
+        const x = @divTrunc(self.logical_w - box_w, 2);
+        const y = @divTrunc(self.logical_h, 24);
+        self.drawRect(x, y, box_w, box_h, c.SDL_Color{ .r = 15, .g = 15, .b = 30, .a = 255 });
+        self.drawRectOutline(x, y, box_w, box_h, COLOR_DIM);
+        self.renderText(text, x + pad_x, y + pad_y, COLOR_FG, self.font_small);
+    }
+
     fn drawRectOutline(self: *Ui, x: i32, y: i32, w: i32, h: i32, col: c.SDL_Color) void {
         _ = c.SDL_SetRenderDrawColor(self.renderer, col.r, col.g, col.b, col.a);
         const r = c.SDL_Rect{ .x = x, .y = y, .w = w, .h = h };
@@ -183,7 +198,6 @@ pub const Ui = struct {
     pub fn drawScanScreen(
         self: *Ui,
         hosts: []const c.IHS_HostInfo,
-        paired_client_id: u64,
         scanning: bool,
     ) void {
         self.clear();
@@ -200,7 +214,6 @@ pub const Ui = struct {
         for (hosts, 0..) |host, i| {
             const y = list_y + @as(i32, @intCast(i)) * row_h;
             const is_sel = (i == self.host_cursor);
-            const is_paired = (host.clientId == paired_client_id);
 
             if (is_sel) {
                 self.drawRect(@divTrunc(self.logical_w, 12), y - 6, self.logical_w - @divTrunc(self.logical_w, 6), row_h - 4, .{ .r = 30, .g = 50, .b = 100, .a = 255 });
@@ -209,11 +222,7 @@ pub const Ui = struct {
             var name_buf: [80]u8 = undefined;
             const name_len = std.mem.indexOfScalar(u8, &host.hostname, 0) orelse host.hostname.len;
             const name = host.hostname[0..name_len];
-            const label = if (is_paired)
-                std.fmt.bufPrintZ(&name_buf, "{s}  [paired]", .{name}) catch continue
-            else
-                std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch continue;
-
+            const label = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch continue;
             const col = if (is_sel) COLOR_SEL else COLOR_FG;
             self.renderText(label, @divTrunc(self.logical_w, 9), y, col, self.font);
         }
