@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y \
     build-essential cmake make nasm pkg-config git curl xz-utils \
     gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
     libdbus-1-dev:arm64 libibus-1.0-dev:arm64 libudev-dev:arm64 \
-    libgles-dev:arm64 libdrm-dev:arm64 libgbm-dev:arm64 libpulse-dev:arm64 \
+    libegl-dev:arm64 libgles-dev:arm64 \
+    libdrm-dev:arm64 libgbm-dev:arm64 libpulse-dev:arm64 \
     libwayland-dev:arm64 libwayland-egl-backend-dev:arm64 \
     libxkbcommon-dev:arm64 libx11-dev:arm64 libxext-dev:arm64 \
     libxrandr-dev:arm64 libxcursor-dev:arm64 libxi-dev:arm64 \

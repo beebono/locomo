@@ -176,7 +176,30 @@ build_rkmpp() {
     echo "    rkmpp done."
 }
 
+apply_ffmpeg_patches() {
+    local src="$REPO_ROOT/external/ffmpeg"
+    local patches_dir="$REPO_ROOT/patches"
+    local marker="$src/.patches-applied"
+
+    [ -d "$patches_dir" ] || return 0
+    if [ -f "$marker" ]; then
+        echo "    FFmpeg patches already applied (remove $marker to re-apply)."
+        return 0
+    fi
+
+    echo ""
+    echo "==> Applying FFmpeg patches..."
+    for p in "$patches_dir"/ffmpeg-*.patch; do
+        [ -e "$p" ] || continue
+        echo "    Applying $(basename "$p")"
+        (cd "$src" && patch -p1 --no-backup-if-mismatch < "$p")
+    done
+    touch "$marker"
+}
+
 build_ffmpeg() {
+    apply_ffmpeg_patches
+
     echo ""
     echo "==> Building FFmpeg..."
 

@@ -4,6 +4,7 @@ const config = @import("config.zig");
 const ui_mod = @import("ui.zig");
 const ihs = @import("ihs.zig");
 const decode = @import("decode.zig");
+const gl = @import("gl.zig");
 const input = @import("input.zig");
 const Io = std.Io;
 const io = std.Options.debug_io;
@@ -130,7 +131,7 @@ fn initAppState(allocator: std.mem.Allocator) !AppState {
         .settings = settings,
         .ui = ui,
         .selected_host = null,
-        .decode_ctx = decode.DecodeCtx.init(allocator, settings.hw_decode),
+        .decode_ctx = try decode.DecodeCtx.init(allocator, settings.hw_decode),
     };
 }
 
@@ -138,6 +139,37 @@ fn deinitAppState(state: *AppState) void {
     state.decode_ctx.deinit();
     state.ui.deinit();
     state.arena.deinit();
+}
+
+fn drawGlToast(overlay: *gl.OverlayRenderer, text: gl.TextureRef, vp_w: c_int, vp_h: c_int) void {
+    const pad_x: c_int = 24;
+    const pad_y: c_int = 12;
+    const box_w = text.width + pad_x * 2;
+    const box_h = text.height + pad_y * 2;
+    const x = @divTrunc(vp_w - box_w, 2);
+    const y = @divTrunc(vp_h, 24);
+    overlay.drawSolidRect(x, y, box_w, box_h, .{ 15.0 / 255.0, 15.0 / 255.0, 30.0 / 255.0, 1.0 });
+    overlay.drawTexturedRect(x + pad_x, y + pad_y, text.width, text.height, text.handle, .{ 1, 1, 1, 1 });
+}
+
+fn computeGlViewport(
+    renderer: *c.SDL_Renderer,
+    cropped_w: c_int,
+    cropped_h: c_int,
+    canvas_w: c_int,
+    canvas_h: c_int,
+) gl.GlRect {
+    var ow: c_int = 0;
+    var oh: c_int = 0;
+    _ = c.SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    if (ow <= 0 or oh <= 0 or canvas_w <= 0 or canvas_h <= 0) {
+        return .{ .x = 0, .y = 0, .w = ow, .h = oh };
+    }
+    const dw = @divTrunc(cropped_w * ow, canvas_w);
+    const dh = @divTrunc(cropped_h * oh, canvas_h);
+    const x = @divTrunc(ow - dw, 2);
+    const top_y = @divTrunc(oh - dh, 2);
+    return .{ .x = x, .y = oh - (top_y + dh), .w = dw, .h = dh };
 }
 
 fn computeFrameDst(
@@ -373,7 +405,7 @@ fn beginStreaming(state: *AppState) !void {
         .screen_w = state.ui.logical_w,
         .screen_h = state.ui.logical_h,
     };
-    var cursor_state = input.CursorState.init(state.allocator);
+    var cursor_state = input.CursorState.init();
     defer cursor_state.deinit();
 
     c.IHS_SessionSetSessionCallbacks(session, &session_callbacks, &sess_ctx);
@@ -394,8 +426,7 @@ fn beginStreaming(state: *AppState) !void {
     var hid_initialized = false;
     defer if (hid_initialized) input.deinit();
 
-    // Heartbeat to suppress Steam's idle-gamepad timeout when the user is
-    // active but holding a steady state (no deltas to send).
+    // Heartbeat to suppress Steam's idle-gamepad timeout
     const heartbeat_interval_ns: i128 = 30 * std.time.ns_per_s;
     const recent_input_window_ns: i128 = 30 * std.time.ns_per_s;
     var last_input_ns: i128 = Io.Clock.awake.now(io).toNanoseconds();
@@ -406,9 +437,31 @@ fn beginStreaming(state: *AppState) !void {
     var tex_h: u32 = 0;
     defer if (texture) |t| c.SDL_DestroyTexture(t);
 
+    var video_renderer: ?gl.VideoRenderer = null;
+    defer if (video_renderer) |*vr| vr.deinit();
+
+    var overlay: ?gl.OverlayRenderer = null;
+    defer if (overlay) |*o| o.deinit();
+
+    var toast1_tex: ?gl.TextureRef = null;
+    var toast2_tex: ?gl.TextureRef = null;
+    defer {
+        if (toast1_tex) |t| {
+            var h = t.handle;
+            c.glDeleteTextures(1, &h);
+        }
+        if (toast2_tex) |t| {
+            var h = t.handle;
+            c.glDeleteTextures(1, &h);
+        }
+    }
+
     var chords: input.ChordTracker = .{};
     var mouse_state: input.MouseState = .{};
     var mouse_mode: bool = false;
+    var last_host_w: c_int = 0;
+    var last_host_h: c_int = 0;
+    var last_video_rect: gl.GlRect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
     const toast_duration_ns: i128 = 4 * std.time.ns_per_s;
     const toast1_until_ns: i128 = Io.Clock.awake.now(io).toNanoseconds() + toast_duration_ns;
@@ -451,7 +504,7 @@ fn beginStreaming(state: *AppState) !void {
         if (state.phase == .quit or state.decode_ctx.force_disconnect.load(.acquire)) break;
 
         if (mouse_mode) {
-            mouse_state.tick(session, &cursor_state, state.ui.logical_w, state.ui.logical_h, Io.Clock.awake.now(io).toNanoseconds());
+            mouse_state.tick(session, &cursor_state, last_host_w, last_host_h, Io.Clock.awake.now(io).toNanoseconds());
         }
 
         if (hid_initialized) {
@@ -466,40 +519,84 @@ fn beginStreaming(state: *AppState) !void {
 
         const got_frame = state.decode_ctx.waitNextFrame(&frame, .{ .duration = .{ .raw = .fromMilliseconds(8), .clock = .awake } });
         if (got_frame) {
-            if (texture == null or frame.width != tex_w or frame.height != tex_h) {
-                if (texture) |t| c.SDL_DestroyTexture(t);
-                texture = c.SDL_CreateTexture(
-                    state.ui.renderer,
-                    c.SDL_PIXELFORMAT_NV12,
-                    c.SDL_TEXTUREACCESS_STREAMING,
-                    @intCast(frame.width),
-                    @intCast(frame.height),
-                );
-                tex_w = frame.width;
-                tex_h = frame.height;
-            }
-
-            if (texture) |t| {
-                _ = c.SDL_UpdateNVTexture(t, null, frame.y.ptr, frame.y_stride, frame.uv.ptr, frame.uv_stride);
-            }
-
             _ = c.SDL_SetRenderDrawColor(state.ui.renderer, 0, 0, 0, 255);
             _ = c.SDL_RenderClear(state.ui.renderer);
-            if (texture) |t| {
-                const dst = computeFrameDst(
-                    state.ui.renderer,
-                    res.w,
-                    res.h,
-                    @intCast(frame.width),
-                    @intCast(frame.height),
-                );
-                _ = c.SDL_RenderCopy(state.ui.renderer, t, null, &dst);
+
+            switch (frame.payload) {
+                .sw => |*sw| {
+                    if (texture == null or frame.width != tex_w or frame.height != tex_h) {
+                        if (texture) |t| c.SDL_DestroyTexture(t);
+                        texture = c.SDL_CreateTexture(
+                            state.ui.renderer,
+                            c.SDL_PIXELFORMAT_NV12,
+                            c.SDL_TEXTUREACCESS_STREAMING,
+                            @intCast(frame.width),
+                            @intCast(frame.height),
+                        );
+                        tex_w = frame.width;
+                        tex_h = frame.height;
+                    }
+                    if (texture) |t| {
+                        _ = c.SDL_UpdateNVTexture(t, null, sw.y.ptr, sw.y_stride, sw.uv.ptr, sw.uv_stride);
+                        const crop_l: c_int = @intCast(frame.crop.left);
+                        const crop_t: c_int = @intCast(frame.crop.top);
+                        const cropped_w: c_int = @as(c_int, @intCast(frame.width)) - crop_l - @as(c_int, @intCast(frame.crop.right));
+                        const cropped_h: c_int = @as(c_int, @intCast(frame.height)) - crop_t - @as(c_int, @intCast(frame.crop.bottom));
+                        const src_rect = c.SDL_Rect{ .x = crop_l, .y = crop_t, .w = cropped_w, .h = cropped_h };
+                        const dst = computeFrameDst(state.ui.renderer, res.w, res.h, cropped_w, cropped_h);
+                        _ = c.SDL_RenderCopy(state.ui.renderer, t, &src_rect, &dst);
+                    }
+                },
+                .drm => |*drm| {
+                    if (video_renderer == null) {
+                        if (state.ui.gl_ctx) |gctx| {
+                            video_renderer = gl.VideoRenderer.init(gctx) catch blk: {
+                                break :blk null;
+                            };
+                            if (video_renderer != null) {
+                                overlay = gl.OverlayRenderer.init(gctx) catch blk: {
+                                    break :blk null;
+                                };
+                                if (overlay != null) {
+                                    toast1_tex = gl.uploadText(state.ui.font_small, toast_text_tip1, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                    toast2_tex = gl.uploadText(state.ui.font_small, toast_text_tip2, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                }
+                            }
+                        }
+                    }
+                    if (video_renderer) |*vr| {
+                        _ = c.SDL_RenderFlush(state.ui.renderer);
+                        const cropped_w: c_int = @as(c_int, @intCast(frame.width)) - @as(c_int, @intCast(frame.crop.left)) - @as(c_int, @intCast(frame.crop.right));
+                        const cropped_h: c_int = @as(c_int, @intCast(frame.height)) - @as(c_int, @intCast(frame.crop.top)) - @as(c_int, @intCast(frame.crop.bottom));
+                        const vp = computeGlViewport(state.ui.renderer, cropped_w, cropped_h, res.w, res.h);
+                        last_host_w = cropped_w;
+                        last_host_h = cropped_h;
+                        const owned = drm.av_frame;
+                        drm.av_frame = undefined;
+                        frame.payload = .{ .sw = .{ .y = &.{}, .uv = &.{}, .y_stride = 0, .uv_stride = 0, .allocator = state.allocator } };
+                        _ = vr.drawDrmFrame(owned, frame.width, frame.height, frame.crop, vp);
+
+                        if (overlay) |*o| {
+                            var ow: c_int = 0;
+                            var oh: c_int = 0;
+                            _ = c.SDL_GetRendererOutputSize(state.ui.renderer, &ow, &oh);
+                            o.beginFrame(ow, oh);
+                            last_video_rect = .{ .x = vp.x, .y = oh - (vp.y + vp.h), .w = vp.w, .h = vp.h };
+                            cursor_state.render(o, last_video_rect, last_host_w, last_host_h, mouse_mode);
+                            const now_ns = Io.Clock.awake.now(io).toNanoseconds();
+                            const active_toast: ?gl.TextureRef =
+                                if (now_ns < toast1_until_ns) toast1_tex else if (now_ns < toast2_until_ns) toast2_tex else null;
+                            if (active_toast) |t| drawGlToast(o, t, ow, oh);
+                        }
+                    }
+                },
             }
-            cursor_state.render(state.ui.renderer, state.ui.logical_w, state.ui.logical_h, mouse_mode);
-            if (Io.Clock.awake.now(io).toNanoseconds() < toast1_until_ns) {
-                state.ui.drawToast(toast_text_tip1);
-            } else if (Io.Clock.awake.now(io).toNanoseconds() < toast2_until_ns) {
-                state.ui.drawToast(toast_text_tip2);
+            if (frame.payload == .sw) {
+                // SW path uses SDL for overlays and doesn't support mouse mode
+                const now_ns = Io.Clock.awake.now(io).toNanoseconds();
+                if (now_ns < toast1_until_ns) {
+                    state.ui.drawToast(toast_text_tip1);
+                }
             }
 
             c.SDL_RenderPresent(state.ui.renderer);
@@ -510,6 +607,13 @@ fn beginStreaming(state: *AppState) !void {
 
     c.IHS_SessionDisconnect(session);
     c.IHS_SessionThreadedJoin(session);
+
+    if (video_renderer) |*vr| {
+        vr.deinit();
+        video_renderer = null;
+    }
+    state.ui.recreateRenderer() catch {};
+
     if (state.phase != .quit) state.phase = .disconnected;
 }
 

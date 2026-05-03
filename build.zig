@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
     // Multiarch/Cross handling
     if (target.result.cpu.arch == .aarch64) {
         mod.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+        mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
     }
 
     // Includes
@@ -115,6 +116,8 @@ pub fn build(b: *std.Build) void {
 
     // System libraries
     mod.linkSystemLibrary("drm", .{});
+    mod.linkSystemLibrary("EGL", .{});
+    mod.linkSystemLibrary("GLESv2", .{});
     mod.linkSystemLibrary("m", .{});
     mod.linkSystemLibrary("dl", .{});
     mod.linkSystemLibrary("pthread", .{});

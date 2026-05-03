@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const config = @import("config.zig");
+const gl = @import("gl.zig");
 
 const FONT_SIZE = 64;
 const FONT_SMALL = 48;
@@ -33,6 +34,7 @@ pub const Ui = struct {
     logical_h: c_int = 720,
     font: *c.TTF_Font,
     font_small: *c.TTF_Font,
+    gl_ctx: ?gl.GlCtx = null,
 
     // Tracked screen states
     host_cursor: usize = 0,
@@ -63,8 +65,13 @@ pub const Ui = struct {
         ) orelse return error.CreateWindowFailed;
         errdefer c.SDL_DestroyWindow(window);
 
+        _ = c.SDL_SetHint(c.SDL_HINT_RENDER_DRIVER, "opengles2");
         const renderer = c.SDL_CreateRenderer(window, -1, c.SDL_RENDERER_ACCELERATED) orelse
             return error.CreateRendererFailed;
+
+        const gl_ctx: ?gl.GlCtx = gl.init() catch blk: {
+            break :blk null;
+        };
         errdefer c.SDL_DestroyRenderer(renderer);
         _ = c.SDL_RenderSetLogicalSize(renderer, screen_w, screen_h);
 
@@ -85,6 +92,19 @@ pub const Ui = struct {
             .logical_h = screen_h,
             .font = font,
             .font_small = font_small,
+            .gl_ctx = gl_ctx,
+        };
+    }
+
+    pub fn recreateRenderer(self: *Ui) !void {
+        c.SDL_DestroyRenderer(self.renderer);
+        _ = c.SDL_SetHint(c.SDL_HINT_RENDER_DRIVER, "opengles2");
+        const renderer = c.SDL_CreateRenderer(self.window, -1, c.SDL_RENDERER_ACCELERATED) orelse
+            return error.CreateRendererFailed;
+        _ = c.SDL_RenderSetLogicalSize(renderer, self.logical_w, self.logical_h);
+        self.renderer = renderer;
+        self.gl_ctx = gl.init() catch blk: {
+            break :blk null;
         };
     }
 

@@ -48,6 +48,15 @@ const PacketRing = struct {
         self.allocator.free(self.slots);
     }
 
+    pub fn reset(self: *PacketRing) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.head = 0;
+        self.tail = 0;
+        self.count = 0;
+        self.shutdown = false;
+    }
+
     pub fn tryPush(self: *PacketRing, src: []const u8, is_keyframe: bool) bool {
         if (src.len > SLOT_CAP) return false;
         self.mutex.lockUncancelable(io);
@@ -87,18 +96,45 @@ const PacketRing = struct {
     }
 };
 
-pub const VideoFrame = struct {
+pub const Crop = struct {
+    top: u32 = 0,
+    bottom: u32 = 0,
+    left: u32 = 0,
+    right: u32 = 0,
+};
+
+pub const SwFrame = struct {
     y: []u8,
     uv: []u8,
-    width: u32,
-    height: u32,
     y_stride: c_int,
     uv_stride: c_int,
     allocator: std.mem.Allocator,
+};
+
+pub const DrmFrame = struct {
+    av_frame: *c.AVFrame,
+};
+
+pub const VideoFrame = struct {
+    width: u32,
+    height: u32,
+    crop: Crop,
+    payload: union(enum) {
+        sw: SwFrame,
+        drm: DrmFrame,
+    },
 
     pub fn deinit(self: *VideoFrame) void {
-        self.allocator.free(self.y);
-        self.allocator.free(self.uv);
+        switch (self.payload) {
+            .sw => |*f| {
+                f.allocator.free(f.y);
+                f.allocator.free(f.uv);
+            },
+            .drm => |*f| {
+                var p: ?*c.AVFrame = f.av_frame;
+                c.av_frame_free(&p);
+            },
+        }
     }
 };
 
@@ -111,6 +147,8 @@ pub const DecodeCtx = struct {
     video_codec_ctx: ?*c.AVCodecContext,
     canvas_w: c_int,
     canvas_h: c_int,
+    display_w: c_int,
+    display_h: c_int,
     req_w: c_int,
     req_h: c_int,
     last_sps_w: c_int,
@@ -124,6 +162,7 @@ pub const DecodeCtx = struct {
     frame_event: std.Io.Event,
     video_ring: ?PacketRing,
     video_thread: ?std.Thread,
+    thread_exited: std.atomic.Value(bool),
     video_lost: std.atomic.Value(bool),
     need_keyframe: std.atomic.Value(bool),
     pending_resize: std.atomic.Value(bool),
@@ -138,7 +177,9 @@ pub const DecodeCtx = struct {
     audio_device: c.SDL_AudioDeviceID,
     audio_max_queue_bytes: u32,
 
-    pub fn init(allocator: std.mem.Allocator, hw_decode: bool) DecodeCtx {
+    pub fn init(allocator: std.mem.Allocator, hw_decode: bool) !DecodeCtx {
+        c.av_log_set_level(c.AV_LOG_FATAL);
+        const ring = try PacketRing.init(allocator);
         return .{
             .allocator = allocator,
             .hw_decode = hw_decode,
@@ -146,6 +187,8 @@ pub const DecodeCtx = struct {
             .video_codec_ctx = null,
             .canvas_w = 0,
             .canvas_h = 0,
+            .display_w = 0,
+            .display_h = 0,
             .req_w = 0,
             .req_h = 0,
             .last_sps_w = 0,
@@ -157,8 +200,9 @@ pub const DecodeCtx = struct {
             .frame_ready = false,
             .frame_mutex = .init,
             .frame_event = .unset,
-            .video_ring = null,
+            .video_ring = ring,
             .video_thread = null,
+            .thread_exited = std.atomic.Value(bool).init(true),
             .video_lost = std.atomic.Value(bool).init(false),
             .need_keyframe = std.atomic.Value(bool).init(false),
             .pending_resize = std.atomic.Value(bool).init(false),
@@ -176,19 +220,29 @@ pub const DecodeCtx = struct {
     pub fn deinit(self: *DecodeCtx) void {
         if (self.video_ring) |*r| r.requestStop();
         if (self.video_thread) |t| {
-            t.join();
+            const deadline_ms: i64 = 250;
+            const start_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+            while (!self.thread_exited.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).toMilliseconds() - start_ms > deadline_ms) break;
+                io.sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+            }
+            if (self.thread_exited.load(.acquire)) t.join() else t.detach();
             self.video_thread = null;
         }
-        if (self.video_ring) |*r| {
-            r.deinit();
-            self.video_ring = null;
+        if (self.thread_exited.load(.acquire)) {
+            if (self.video_ring) |*r| {
+                r.deinit();
+                self.video_ring = null;
+            }
         }
         if (self.pending_frame) |*f| f.deinit();
         self.pending_frame = null;
-        if (self.av_sw_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
-        if (self.av_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
-        if (self.parser) |p| c.av_parser_close(p);
-        if (self.video_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
+        if (self.thread_exited.load(.acquire)) {
+            if (self.av_sw_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
+            if (self.av_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
+            if (self.parser) |p| c.av_parser_close(p);
+            if (self.video_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
+        }
         if (self.audio_swr_ctx) |s| c.swr_free(@ptrCast(@constCast(&s)));
         if (self.audio_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
     }
@@ -219,6 +273,15 @@ fn applyExtradata(cc: *c.AVCodecContext, data: ?[]const u8) void {
     cc.extradata_size = @intCast(bytes.len);
 }
 
+fn getDrmFormat(cc: [*c]c.AVCodecContext, fmts: [*c]const c_int) callconv(.c) c_int {
+    _ = cc;
+    var p = fmts;
+    while (p[0] != -1) : (p += 1) {
+        if (p[0] == c.AV_PIX_FMT_DRM_PRIME) return p[0];
+    }
+    return c.AV_PIX_FMT_NONE;
+}
+
 fn openCandidate(w: c_int, h: c_int, extradata: ?[]const u8, name: [*:0]const u8, hw_type: c.AVHWDeviceType) ?*c.AVCodecContext {
     const codec = c.avcodec_find_decoder_by_name(name) orelse return null;
     const cc = c.avcodec_alloc_context3(codec) orelse return null;
@@ -226,11 +289,13 @@ fn openCandidate(w: c_int, h: c_int, extradata: ?[]const u8, name: [*:0]const u8
     cc.*.height = h;
     cc.*.flags |= c.AV_CODEC_FLAG_LOW_DELAY;
     applyExtradata(cc, extradata);
-    if (hw_type != c.AV_HWDEVICE_TYPE_NONE) {
-        if (c.av_hwdevice_ctx_create(&cc.*.hw_device_ctx, hw_type, null, null, 0) < 0) {
+    if (hw_type == c.AV_HWDEVICE_TYPE_DRM) {
+        if (c.av_hwdevice_ctx_create(&cc.*.hw_device_ctx, hw_type, "/dev/dri/card0", null, 0) < 0) {
             c.avcodec_free_context(@ptrCast(@constCast(&cc)));
             return null;
         }
+        cc.*.get_format = getDrmFormat;
+        cc.*.pix_fmt = c.AV_PIX_FMT_DRM_PRIME;
     }
     if (c.avcodec_open2(cc, codec, null) < 0) {
         c.avcodec_free_context(@ptrCast(@constCast(&cc)));
@@ -260,10 +325,10 @@ fn selectCodec(codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extra
     };
     const is_hevc = codec_id == c.AV_CODEC_ID_HEVC;
     const hw_candidates: []const Candidate = if (is_hevc) &.{
-        .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+        .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
         .{ .name = "hevc_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
     } else &.{
-        .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+        .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
         .{ .name = "h264_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
     };
     if (hw_decode) {
@@ -272,7 +337,7 @@ fn selectCodec(codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extra
                 return cc;
             }
         }
-        std.debug.print("[decode] No HW decoder available, falling back to SW\n", .{});
+        std.log.warn("[locomo] No HW decoder available, falling back to SW\n", .{});
     }
     return openSoftware(w, h, extradata, codec_id);
 }
@@ -303,20 +368,17 @@ fn videoStart(
     ctx.video_codec_ctx = codec_ctx;
     ctx.canvas_w = width;
     ctx.canvas_h = height;
+    ctx.display_w = @intCast(cfg.width);
+    ctx.display_h = @intCast(cfg.height);
     ctx.req_w = width;
     ctx.req_h = height;
     ctx.parser = c.av_parser_init(@intCast(codec_id));
     ctx.av_frame = c.av_frame_alloc();
     ctx.av_sw_frame = c.av_frame_alloc();
 
-    ctx.video_ring = PacketRing.init(ctx.allocator) catch {
-        c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
-        ctx.video_codec_ctx = null;
-        return -1;
-    };
+    if (ctx.video_ring) |*r| r.reset();
+    ctx.thread_exited.store(false, .release);
     ctx.video_thread = std.Thread.spawn(.{}, videoDecodeThread, .{ctx}) catch {
-        ctx.video_ring.?.deinit();
-        ctx.video_ring = null;
         c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
         ctx.video_codec_ctx = null;
         return -1;
@@ -335,6 +397,8 @@ fn videoSetCaptureSize(
     const ctx: *DecodeCtx = @ptrCast(@alignCast(ctx_ptr.?));
     ctx.canvas_w = width;
     ctx.canvas_h = height;
+    ctx.display_w = width;
+    ctx.display_h = height;
     ctx.pending_w.store(alignUp16(@intCast(width)), .release);
     ctx.pending_h.store(alignUp16(@intCast(height)), .release);
     ctx.pending_resize.store(true, .release);
@@ -390,15 +454,44 @@ fn videoSubmit(
     return c.IHS_StreamVideoSubmitOK;
 }
 
-fn populateFrame(ctx: *DecodeCtx) void {
-    const av_frame = ctx.av_frame orelse return;
-    const sw_frame = ctx.av_sw_frame orelse return;
+fn populateFrame(ctx: *DecodeCtx) bool {
+    const av_frame = ctx.av_frame orelse return false;
+    const sw_frame = ctx.av_sw_frame orelse return false;
     defer c.av_frame_unref(av_frame);
+
+    if (av_frame.format == c.AV_PIX_FMT_DRM_PRIME) {
+        const cloned = c.av_frame_clone(av_frame) orelse return false;
+        const w = av_frame.width;
+        const h = av_frame.height;
+        const new_frame = VideoFrame{
+            .width = @intCast(w),
+            .height = @intCast(h),
+            .crop = .{
+                .top = 0,
+                .bottom = if (ctx.display_h > 0 and ctx.display_h < h) @intCast(h - ctx.display_h) else 0,
+                .left = 0,
+                .right = if (ctx.display_w > 0 and ctx.display_w < w) @intCast(w - ctx.display_w) else 0,
+            },
+            .payload = .{ .drm = .{ .av_frame = cloned } },
+        };
+        {
+            ctx.frame_mutex.lockUncancelable(io);
+            defer ctx.frame_mutex.unlock(io);
+            if (ctx.frame_ready) {
+                if (ctx.pending_frame) |*old| old.deinit();
+                ctx.pending_frame = null;
+            }
+            ctx.pending_frame = new_frame;
+            ctx.frame_ready = true;
+        }
+        ctx.frame_event.set(io);
+        return true;
+    }
 
     const is_hw = av_frame.hw_frames_ctx != null;
     if (is_hw) {
         c.av_frame_unref(sw_frame);
-        if (c.av_hwframe_transfer_data(sw_frame, av_frame, 0) < 0) return;
+        if (c.av_hwframe_transfer_data(sw_frame, av_frame, 0) < 0) return false;
     }
     const src: *c.AVFrame = if (is_hw) sw_frame else av_frame;
     defer if (is_hw) c.av_frame_unref(sw_frame);
@@ -410,7 +503,7 @@ fn populateFrame(ctx: *DecodeCtx) void {
     const y_stride = src.linesize[0];
     const y_sz: usize = @intCast(y_stride * h);
 
-    const plane_y = ctx.allocator.alloc(u8, y_sz) catch return;
+    const plane_y = ctx.allocator.alloc(u8, y_sz) catch return false;
     @memcpy(plane_y, src.data[0][0..y_sz]);
 
     var uv_stride: c_int = 0;
@@ -421,7 +514,7 @@ fn populateFrame(ctx: *DecodeCtx) void {
             const uv_sz: usize = @intCast(uv_stride * uv_h);
             plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
                 ctx.allocator.free(plane_y);
-                return;
+                return false;
             };
             @memcpy(plane_uv, src.data[1][0..uv_sz]);
         },
@@ -430,7 +523,7 @@ fn populateFrame(ctx: *DecodeCtx) void {
             const uv_sz: usize = @intCast(uv_stride * uv_h);
             plane_uv = ctx.allocator.alloc(u8, uv_sz) catch {
                 ctx.allocator.free(plane_y);
-                return;
+                return false;
             };
             const u_stride: usize = @intCast(src.linesize[1]);
             const v_stride: usize = @intCast(src.linesize[2]);
@@ -450,7 +543,7 @@ fn populateFrame(ctx: *DecodeCtx) void {
         },
         else => {
             ctx.allocator.free(plane_y);
-            return;
+            return false;
         },
     }
 
@@ -458,17 +551,25 @@ fn populateFrame(ctx: *DecodeCtx) void {
     if (std.mem.allEqual(u8, plane_uv, 0)) {
         ctx.allocator.free(plane_y);
         ctx.allocator.free(plane_uv);
-        return;
+        return false;
     }
 
     const new_frame = VideoFrame{
-        .y = plane_y,
-        .uv = plane_uv,
         .width = @intCast(w),
         .height = @intCast(h),
-        .y_stride = y_stride,
-        .uv_stride = uv_stride,
-        .allocator = ctx.allocator,
+        .crop = .{
+            .top = 0,
+            .bottom = if (ctx.display_h > 0 and ctx.display_h < h) @intCast(h - ctx.display_h) else 0,
+            .left = 0,
+            .right = if (ctx.display_w > 0 and ctx.display_w < w) @intCast(w - ctx.display_w) else 0,
+        },
+        .payload = .{ .sw = .{
+            .y = plane_y,
+            .uv = plane_uv,
+            .y_stride = y_stride,
+            .uv_stride = uv_stride,
+            .allocator = ctx.allocator,
+        } },
     };
 
     {
@@ -482,6 +583,7 @@ fn populateFrame(ctx: *DecodeCtx) void {
         ctx.frame_ready = true;
     }
     ctx.frame_event.set(io);
+    return true;
 }
 
 fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
@@ -501,12 +603,15 @@ fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
 }
 
 fn videoDecodeThread(ctx: *DecodeCtx) void {
+    defer ctx.thread_exited.store(true, .release);
     const ring = if (ctx.video_ring) |*r| r else return;
 
     const scratch = ctx.allocator.alloc(u8, SLOT_CAP) catch return;
     defer ctx.allocator.free(scratch);
 
     var waiting_for_keyframe = true;
+    var consecutive_bad_frames: u32 = 0;
+    const bad_frame_limit: u32 = 60;
 
     while (!ctx.force_disconnect.load(.acquire)) {
         var is_keyframe: bool = false;
@@ -575,7 +680,14 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
         while (!ctx.force_disconnect.load(.acquire)) {
             const r = c.avcodec_receive_frame(codec_ctx, ctx.av_frame);
             if (r == 0) {
-                populateFrame(ctx);
+                if (populateFrame(ctx)) {
+                    consecutive_bad_frames = 0;
+                } else {
+                    consecutive_bad_frames += 1;
+                    if (consecutive_bad_frames >= bad_frame_limit) {
+                        ctx.force_disconnect.store(true, .release);
+                    }
+                }
                 break;
             }
             if (r == c.AVERROR(c.EAGAIN) or r == c.AVERROR_EOF) break;
@@ -597,29 +709,44 @@ fn videoStop(
     const ctx: *DecodeCtx = @ptrCast(@alignCast(ctx_ptr.?));
 
     if (ctx.video_ring) |*r| r.requestStop();
-    if (ctx.video_thread) |t| {
-        t.join();
-        ctx.video_thread = null;
-    }
-    if (ctx.video_ring) |*r| {
-        r.deinit();
-        ctx.video_ring = null;
+
+    const join_deadline_ms: i64 = 250;
+    const poll_interval_ns: u64 = 5 * std.time.ns_per_ms;
+    const start_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    while (!ctx.thread_exited.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).toMilliseconds() - start_ms > join_deadline_ms) break;
+        io.sleep(.fromNanoseconds(poll_interval_ns), .awake) catch {};
     }
 
-    if (ctx.av_sw_frame) |f| {
-        c.av_frame_free(@ptrCast(@constCast(&f)));
+    if (ctx.thread_exited.load(.acquire)) {
+        if (ctx.video_thread) |t| {
+            t.join();
+            ctx.video_thread = null;
+        }
+        if (ctx.av_sw_frame) |f| {
+            c.av_frame_free(@ptrCast(@constCast(&f)));
+            ctx.av_sw_frame = null;
+        }
+        if (ctx.av_frame) |f| {
+            c.av_frame_free(@ptrCast(@constCast(&f)));
+            ctx.av_frame = null;
+        }
+        if (ctx.parser) |p| {
+            c.av_parser_close(p);
+            ctx.parser = null;
+        }
+        if (ctx.video_codec_ctx) |cc| {
+            c.avcodec_free_context(@ptrCast(@constCast(&cc)));
+            ctx.video_codec_ctx = null;
+        }
+    } else {
+        if (ctx.video_thread) |t| {
+            t.detach();
+            ctx.video_thread = null;
+        }
         ctx.av_sw_frame = null;
-    }
-    if (ctx.av_frame) |f| {
-        c.av_frame_free(@ptrCast(@constCast(&f)));
         ctx.av_frame = null;
-    }
-    if (ctx.parser) |p| {
-        c.av_parser_close(p);
         ctx.parser = null;
-    }
-    if (ctx.video_codec_ctx) |cc| {
-        c.avcodec_free_context(@ptrCast(@constCast(&cc)));
         ctx.video_codec_ctx = null;
     }
 }
