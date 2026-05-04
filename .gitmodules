@@ -17,3 +17,13 @@
 	path = external/rkmpp
 	url = https://github.com/rockchip-linux/mpp.git
 	branch = develop
+[submodule "external/libudev-zero"]
+	path = external/libudev-zero
+	url = https://github.com/illiliti/libudev-zero.git
+[submodule "external/protobuf-c"]
+	path = external/protobuf-c
+	url = https://github.com/protobuf-c/protobuf-c.git
+[submodule "external/mbedtls"]
+	path = external/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git
+	branch = archive/mbedtls-2.28

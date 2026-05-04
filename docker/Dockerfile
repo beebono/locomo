@@ -12,9 +12,10 @@ deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-security main restri
     >> /etc/apt/sources.list
 
 RUN apt-get update && apt-get install -y \
-    build-essential cmake make nasm pkg-config git curl xz-utils \
-    rsync gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-    libdbus-1-dev:arm64 libibus-1.0-dev:arm64 libudev-dev:arm64 \
+    build-essential cmake make nasm pkg-config \
+    autoconf automake libtool rsync git curl xz-utils \
+    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    libdbus-1-dev:arm64 libibus-1.0-dev:arm64 \
     libegl-dev:arm64 libgles-dev:arm64 \
     libdrm-dev:arm64 libgbm-dev:arm64 libpulse-dev:arm64 \
     libwayland-dev:arm64 libwayland-egl-backend-dev:arm64 \
@@ -26,6 +27,7 @@ RUN apt-get update && apt-get install -y \
 RUN printf '#!/bin/sh\nPKG_CONFIG_PATH="" PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:+$PKG_CONFIG_LIBDIR:}/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" pkg-config "$@"\n' \
     > /usr/local/bin/aarch64-linux-gnu-pkg-config && \
     chmod +x /usr/local/bin/aarch64-linux-gnu-pkg-config
+
 
 # Updated headers for ffmpeg/v4l2-request
 RUN set -eux; \

@@ -105,8 +105,10 @@ pub fn build(b: *std.Build) void {
 
     // Bootstrap built libraries
     mod.addObjectFile(b.path("libs/lib/libSDL2.so"));
-    mod.addObjectFile(b.path("libs/lib/libSDL2_ttf.so"));
-    mod.addObjectFile(b.path("libs/lib/librockchip_mpp.so"));
+    mod.addObjectFile(b.path("libs/lib/libSDL2_ttf.a"));
+    mod.addObjectFile(b.path("libs/lib/libfreetype.a"));
+    mod.addObjectFile(b.path("libs/lib/librockchip_mpp.a"));
+    mod.addObjectFile(b.path("libs/lib/libudev.a"));
     mod.addObjectFile(b.path("libs/lib/libavcodec.a"));
     mod.addObjectFile(b.path("libs/lib/libavformat.a"));
     mod.addObjectFile(b.path("libs/lib/libavutil.a"));
@@ -115,7 +117,6 @@ pub fn build(b: *std.Build) void {
     mod.addObjectFile(b.path("libs/lib/libprotobuf-c.a"));
 
     // System libraries
-    mod.linkSystemLibrary("udev", .{});
     mod.linkSystemLibrary("drm", .{});
     mod.linkSystemLibrary("EGL", .{});
     mod.linkSystemLibrary("GLESv2", .{});
@@ -124,11 +125,6 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("pthread", .{});
     mod.link_libc = true;
 
-    b.installFile("assets/Asap-Medium.otf", "bin/assets/Asap-Medium.otf");
-    b.installFile("libs/lib/libSDL2-2.0.so.0", "bin/lib/libSDL2-2.0.so.0");
-    b.installFile("libs/lib/libSDL2_ttf-2.0.so.0", "bin/lib/libSDL2_ttf-2.0.so.0");
-    b.installFile("libs/lib/librockchip_mpp.so.1", "bin/lib/librockchip_mpp.so.1");
-    b.installFile("scripts/launcher/locomo.sh", "bin/locomo.sh");
     const install_step = b.addInstallArtifact(exe, .{});
 
     const run_cmd = b.addRunArtifact(exe);

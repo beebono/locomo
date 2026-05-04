@@ -43,6 +43,53 @@ cmake_cross_flags() {
     fi
 }
 
+build_mbedtls() {
+    echo ""
+    echo "==> Building mbedTLS..."
+
+    local src="$REPO_ROOT/external/mbedtls"
+    local build="$BUILD_DIR/mbedtls-build"
+
+    mkdir -p "$build"
+
+    # shellcheck disable=SC2046
+    cmake -S "$src" -B "$build" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
+        -DBUILD_SHARED_LIBS=OFF -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+        -DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
+        $(cmake_cross_flags)
+
+    cmake --build "$build" --parallel "$JOBS"
+    cmake --install "$build"
+
+    echo "    mbedTLS done."
+}
+
+build_protobuf_c() {
+    echo ""
+    echo "==> Building protobuf-c..."
+
+    local src="$REPO_ROOT/external/protobuf-c"
+
+    cd "$src"
+
+    ./autogen.sh
+
+    # shellcheck disable=SC2046
+    ./configure \
+        --prefix="$LIBS_DIR" \
+        --disable-shared \
+        --enable-static \
+        --disable-protoc \
+        $(cross_flags)
+
+    make -j"$JOBS"
+    make install
+    cd "$REPO_ROOT"
+
+    echo "    protobuf-c done."
+}
+
 build_sdl2() {
     echo ""
     echo "==> Building SDL2..."
@@ -60,7 +107,7 @@ build_sdl2() {
     # shellcheck disable=SC2046
     "${pkg_config_env[@]}" cmake -S "$src" -B "$build" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
-        -DSDL_STATIC=OFF -DSDL_SHARED=ON -DSDL_TEST=OFF -DSDL_RPATH=OFF \
+        -DSDL_TEST=OFF -DSDL_RPATH=OFF \
         $(cmake_cross_flags)
 
     cmake --build "$build" --parallel "$JOBS"
@@ -81,8 +128,8 @@ build_sdl2_ttf() {
     # shellcheck disable=SC2046
     cmake -S "$src" -B "$build" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
+        -DBUILD_SHARED_LIBS=OFF -DSDL2_DIR="$LIBS_DIR/lib/cmake/SDL2" \
         -DSDL2TTF_SAMPLES=OFF -DSDL2TTF_INSTALL=ON -DSDL2TTF_VENDORED=ON \
-        -DSDL2_DIR="$LIBS_DIR/lib/cmake/SDL2" \
         $(cmake_cross_flags)
 
     cmake --build "$build" --parallel "$JOBS"
@@ -91,68 +138,24 @@ build_sdl2_ttf() {
     echo "    SDL2_ttf done."
 }
 
-build_mbedtls() {
+build_udev_zero() {
     echo ""
-    echo "==> Building mbedTLS..."
+    echo "==> Building udev-zero..."
 
-    local version="2.28.8"
-    local tarball="$BUILD_DIR/mbedtls-${version}.tar.bz2"
-    local src="$BUILD_DIR/mbedtls-${version}"
-    local build="$BUILD_DIR/mbedtls-build"
+    local src="$REPO_ROOT/external/libudev-zero"
 
-    if [ ! -d "$src" ]; then
-        [ -f "$tarball" ] || \
-            curl -fsSL "https://github.com/Mbed-TLS/mbedtls/releases/download/v${version}/mbedtls-${version}.tar.bz2" \
-                -o "$tarball"
-        tar -xjf "$tarball" -C "$BUILD_DIR"
+    local make_flags=()
+    if [ -n "$TARGET" ]; then
+        make_flags+=(CC="${TARGET}-gcc" AR="${TARGET}-ar")
     fi
 
-    mkdir -p "$build"
-
     # shellcheck disable=SC2046
-    cmake -S "$src" -B "$build" \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
-        -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
-        -DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
-        $(cmake_cross_flags)
+    make -C "$src" \
+        "${make_flags[@]+"${make_flags[@]}"}" \
+        PREFIX="$LIBS_DIR" \
+        install-static
 
-    cmake --build "$build" --parallel "$JOBS"
-    cmake --install "$build"
-
-    echo "    mbedTLS done."
-}
-
-build_protobuf_c() {
-    echo ""
-    echo "==> Building protobuf-c..."
-
-    local version="1.5.0"
-    local tarball="$BUILD_DIR/protobuf-c-${version}.tar.gz"
-    local src="$BUILD_DIR/protobuf-c-${version}"
-
-    if [ ! -d "$src" ]; then
-        if [ ! -f "$tarball" ]; then
-            curl -fsSL "https://github.com/protobuf-c/protobuf-c/releases/download/v${version}/protobuf-c-${version}.tar.gz" \
-                -o "$tarball"
-        fi
-        tar -xzf "$tarball" -C "$BUILD_DIR"
-    fi
-
-    cd "$src"
-
-    # shellcheck disable=SC2046
-    ./configure \
-        --prefix="$LIBS_DIR" \
-        --disable-shared \
-        --enable-static \
-        --disable-protoc \
-        $(cross_flags)
-
-    make -j"$JOBS"
-    make install
-    cd "$REPO_ROOT"
-
-    echo "    protobuf-c done."
+    echo "    udev-zero done."
 }
 
 build_rkmpp() {
@@ -166,8 +169,9 @@ build_rkmpp() {
 
     # shellcheck disable=SC2046
     cmake -S "$src" -B "$build" \
+        -DCMAKE_C_FLAGS="-mno-outline-atomics" -DCMAKE_CXX_FLAGS="-mno-outline-atomics" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LIBS_DIR" \
-        -DBUILD_TEST=OFF \
+        -DBUILD_SHARED_LIBS=OFF -DBUILD_TEST=OFF \
         $(cmake_cross_flags)
 
     cmake --build "$build" --parallel "$JOBS"
@@ -253,10 +257,11 @@ build_ffmpeg() {
 }
 
 check_deps
-build_sdl2
-build_sdl2_ttf
 build_mbedtls
 build_protobuf_c
+build_sdl2
+build_sdl2_ttf
+build_udev_zero
 build_rkmpp
 build_ffmpeg
 

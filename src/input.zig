@@ -204,7 +204,7 @@ pub const MouseState = struct {
     }
 };
 
-const cursor_rgba = @embedFile("cursor/right_ptr.rgba");
+const cursor_rgba = @embedFile("assets/right_ptr.rgba");
 const cursor_w: c_int = 24;
 const cursor_h: c_int = 24;
 const cursor_hot_x: c_int = 1;
