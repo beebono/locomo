@@ -23,7 +23,7 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 - ARM64 Linux (aarch64)
 - VPU hardware for video decoding (software decoding also available)
 - EGL and OpenGL ES 2.0 for zero-copy DRM frame rendering
-- `libdrm` and `libSDL2` available on the system
+- `libSDL2` available on the system
 - A Steam host on the same local network with Remote Play enabled
 
 ### Build (Docker path - recommended)
@@ -34,9 +34,8 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 ### Build (native / manual path)
 
 - Zig 0.16.0
-- `cmake`, `make`, `nasm`, `pkg-config`, `curl`, `autoconf`, `automake`, `libtool`
-- aarch64 cross-compiler (`gcc-aarch64-linux-gnu`) when cross-compiling
-- ARM64 sysroot with: `libdbus`, `libibus`, `libegl`, `libgles`, `libdrm`, `libgbm`, `libpulse`, `libwayland`, `libxkbcommon`
+- `cmake`, `make`, `nasm`, `pkg-config`, `autoconf`, `automake`, `libtool`, `meson`, `ninja-build`
+- ARM64 sysroot with: `libdbus`, `libibus`, `libegl`, `libgles`, `libgbm`, `libpulse`, `libwayland`, `libxkbcommon`
 
 ## Building
 

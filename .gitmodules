@@ -27,3 +27,6 @@
 	path = external/mbedtls
 	url = https://github.com/Mbed-TLS/mbedtls.git
 	branch = archive/mbedtls-2.28
+[submodule "external/libdrm"]
+	path = external/libdrm
+	url = https://gitlab.freedesktop.org/mesa/libdrm.git
