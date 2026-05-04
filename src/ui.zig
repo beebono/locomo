@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const config = @import("config.zig");
 const gl = @import("gl.zig");
+const input = @import("input.zig");
 
 const FONT_BIG = 64;
 const FONT_SMALL = 48;
@@ -119,7 +120,7 @@ pub const Ui = struct {
         c.SDL_Quit();
     }
 
-    pub fn pollEvents(self: *Ui) UiEvent {
+    pub fn pollEvents(self: *Ui, swap: config.ButtonSwap) UiEvent {
         _ = self;
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event) != 0) {
@@ -129,7 +130,7 @@ pub const Ui = struct {
                     _ = c.SDL_GameControllerOpen(event.cdevice.which);
                 },
                 c.SDL_CONTROLLERBUTTONDOWN => {
-                    const btn = event.cbutton.button;
+                    const btn = input.swapButton(event.cbutton.button, swap);
                     if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_UP) return .dpad_up;
                     if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_DOWN) return .dpad_down;
                     if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_LEFT) return .dpad_left;
@@ -324,7 +325,7 @@ pub const Ui = struct {
         self.clear();
         self.renderTextCentered("Settings", @divTrunc(self.logical_h, 12), COLOR_FG, self.font);
 
-        const rows = [_][:0]const u8{ "Quality Preset", "Resolution", "Bandwidth Limit", "Framerate Limit", "Audio Type", "H.265 / HEVC (WIP)", "HW Decode" };
+        const rows = [_][:0]const u8{ "Quality Preset", "Resolution", "Bandwidth Limit", "Framerate Limit", "Audio Type", "H.265 / HEVC (WIP)", "HW Decode", "Button Swap" };
         const start_y: i32 = @divTrunc(self.logical_h, 9) * 2;
         const row_h: i32 = @divTrunc(self.logical_h, 12);
 
@@ -367,6 +368,10 @@ pub const Ui = struct {
                 6 => blk: {
                     break :blk if (s.hw_decode) "On" else "Off";
                 },
+                7 => blk: {
+                    const bsi = buttonSwapIndex(s.button_swap);
+                    break :blk config.button_swap_options[bsi].label;
+                },
                 else => std.fmt.bufPrintZ(&vbuf, "", .{}) catch "",
             };
 
@@ -379,7 +384,7 @@ pub const Ui = struct {
 
     pub fn settingsMoveRow(self: *Ui, delta: i32) void {
         const r: i32 = @intCast(self.settings_row);
-        self.settings_row = @intCast(@mod(r + delta + 7, 7));
+        self.settings_row = @intCast(@mod(r + delta + 8, 8));
     }
 
     pub fn settingsAdjust(self: *Ui, s: *config.Settings, delta: i32) void {
@@ -422,8 +427,21 @@ pub const Ui = struct {
             6 => {
                 s.hw_decode = !s.hw_decode;
             },
+            7 => {
+                const n: i32 = @intCast(config.button_swap_options.len);
+                var bsi: i32 = @intCast(buttonSwapIndex(s.button_swap));
+                bsi = @mod(bsi + delta + n, n);
+                s.button_swap = config.button_swap_options[@intCast(bsi)].value;
+            },
             else => {},
         }
+    }
+
+    fn buttonSwapIndex(v: config.ButtonSwap) usize {
+        for (config.button_swap_options, 0..) |o, i| {
+            if (o.value == v) return i;
+        }
+        return 0;
     }
 
     fn qualityIndex(quality: u32) usize {

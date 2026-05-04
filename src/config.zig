@@ -15,6 +15,8 @@ pub const PairedHost = struct {
     steam_id: u64,
 };
 
+pub const ButtonSwap = enum { none, ab, xy, all };
+
 pub const Settings = struct {
     quality: u32 = 2,
     width: u32 = 0,
@@ -24,6 +26,15 @@ pub const Settings = struct {
     framerate_limit: u32 = 0,
     enable_hevc: bool = false,
     hw_decode: bool = true,
+    button_swap: ButtonSwap = .none,
+};
+
+pub const ButtonSwapOption = struct { value: ButtonSwap, label: [:0]const u8 };
+pub const button_swap_options = [_]ButtonSwapOption{
+    .{ .value = .none, .label = "None" },
+    .{ .value = .ab, .label = "Swap A-B" },
+    .{ .value = .xy, .label = "Swap X-Y" },
+    .{ .value = .all, .label = "Swap All" },
 };
 
 pub const QualityOption = struct { quality_preset: u32, label: [:0]const u8 };

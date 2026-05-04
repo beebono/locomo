@@ -249,7 +249,7 @@ fn scanForHosts(state: *AppState) void {
         const scanning = !disc_ctx.done.load(.acquire);
         state.ui.drawScanScreen(hosts, scanning);
 
-        const ev = state.ui.pollEvents();
+        const ev = state.ui.pollEvents(state.settings.button_swap);
         switch (ev) {
             .quit => {
                 state.phase = .quit;
@@ -310,7 +310,7 @@ fn pairWithPin(state: *AppState) !void {
 
     while (!auth_ctx.done.load(.acquire)) {
         state.ui.drawPinDisplay(&pin);
-        switch (state.ui.pollEvents()) {
+        switch (state.ui.pollEvents(state.settings.button_swap)) {
             .quit => {
                 state.phase = .quit;
                 auth_ctx.stop();
@@ -484,21 +484,21 @@ fn beginStreaming(state: *AppState) !void {
                 c.IHS_SessionDisconnect(session);
                 break;
             }
-            if (chords.observe(&event)) |action| switch (action) {
+            if (chords.observe(&event, state.settings.button_swap)) |action| switch (action) {
                 .disconnect => {
                     c.IHS_SessionDisconnect(session);
                     break;
                 },
                 .toggle_mouse => {
                     mouse_mode = !mouse_mode;
-                    mouse_state.reset(session);
+                    mouse_state.reset(session, &cursor_state);
                 },
             };
             if (mouse_mode) mouse_state.observe(session, &event);
             if (mouse_mode and input.MouseState.isMouseModeAxisEvent(&event)) {
                 continue;
             }
-            if (input.handleEvent(session, &event)) {
+            if (input.handleEvent(session, &event, state.settings.button_swap)) {
                 last_input_ns = Io.Clock.awake.now(io).toNanoseconds();
             }
         }
@@ -547,6 +547,12 @@ fn beginStreaming(state: *AppState) !void {
                         const src_rect = c.SDL_Rect{ .x = crop_l, .y = crop_t, .w = cropped_w, .h = cropped_h };
                         const dst = computeFrameDst(state.ui.renderer, res.w, res.h, cropped_w, cropped_h);
                         _ = c.SDL_RenderCopy(state.ui.renderer, t, &src_rect, &dst);
+                        if (cropped_w != last_host_w or cropped_h != last_host_h) {
+                            cursor_state.recenter();
+                        }
+                        last_host_w = cropped_w;
+                        last_host_h = cropped_h;
+                        cursor_state.renderSdl(state.ui.renderer, dst, last_host_w, last_host_h, mouse_mode);
                     }
                 },
                 .drm => |*drm| {
@@ -576,6 +582,9 @@ fn beginStreaming(state: *AppState) !void {
                         const cropped_w: c_int = @as(c_int, @intCast(frame.width)) - @as(c_int, @intCast(frame.crop.left)) - @as(c_int, @intCast(frame.crop.right));
                         const cropped_h: c_int = @as(c_int, @intCast(frame.height)) - @as(c_int, @intCast(frame.crop.top)) - @as(c_int, @intCast(frame.crop.bottom));
                         const vp = computeGlViewport(state.ui.renderer, cropped_w, cropped_h, res.w, res.h);
+                        if (cropped_w != last_host_w or cropped_h != last_host_h) {
+                            cursor_state.recenter();
+                        }
                         last_host_w = cropped_w;
                         last_host_h = cropped_h;
                         const owned = drm.av_frame;
@@ -599,10 +608,12 @@ fn beginStreaming(state: *AppState) !void {
                 },
             }
             if (frame.payload == .sw) {
-                // SW path uses SDL for overlays and doesn't support mouse mode
+                // SW path uses SDL for overlays
                 const now_ns = Io.Clock.awake.now(io).toNanoseconds();
                 if (now_ns < toast1_until_ns) {
                     if (state.ui.logical_w >= 1600) state.ui.drawToast(toast_text_tip1) else state.ui.drawToast(toast_text_tip1_short);
+                } else if (now_ns < toast2_until_ns) {
+                    if (state.ui.logical_w >= 1600) state.ui.drawToast(toast_text_tip2) else state.ui.drawToast(toast_text_tip2_short);
                 }
             }
 
@@ -632,7 +643,7 @@ fn settingsScreen(state: *AppState) void {
 
     while (true) {
         state.ui.drawSettingsScreen(s);
-        switch (state.ui.pollEvents()) {
+        switch (state.ui.pollEvents(state.settings.button_swap)) {
             .quit => {
                 state.phase = .quit;
                 return;
@@ -657,7 +668,7 @@ fn settingsScreen(state: *AppState) void {
 
 fn waitForA(state: *AppState) void {
     while (true) {
-        switch (state.ui.pollEvents()) {
+        switch (state.ui.pollEvents(state.settings.button_swap)) {
             .button_a, .quit => return,
             else => {},
         }
@@ -667,7 +678,7 @@ fn waitForA(state: *AppState) void {
 
 fn waitForAorB(state: *AppState) ui_mod.UiEvent {
     while (true) {
-        const ev = state.ui.pollEvents();
+        const ev = state.ui.pollEvents(state.settings.button_swap);
         switch (ev) {
             .button_a, .button_b, .quit => return ev,
             else => {},
@@ -679,7 +690,7 @@ fn waitForAorB(state: *AppState) ui_mod.UiEvent {
 fn confirmQuit(state: *AppState) bool {
     state.ui.drawStatus("Press Start to quit or B to resume.");
     while (true) {
-        switch (state.ui.pollEvents()) {
+        switch (state.ui.pollEvents(state.settings.button_swap)) {
             .button_start, .quit => return true,
             .button_b => return false,
             else => {},
