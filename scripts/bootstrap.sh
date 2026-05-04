@@ -237,10 +237,13 @@ build_ffmpeg() {
         --enable-decoder=h264_v4l2m2m --enable-decoder=hevc_v4l2m2m \
         --enable-decoder=h264_rkmpp --enable-decoder=hevc_rkmpp \
         --enable-decoder=aac --enable-decoder=opus \
-        --enable-v4l2-m2m --enable-rkmpp \
-        --enable-libdrm --enable-version3 \
+        --enable-hwaccel=h264_v4l2request --enable-hwaccel=hevc_v4l2request \
+        --enable-v4l2-m2m --enable-v4l2-request \
+        --enable-version3 --enable-rkmpp \
+        --enable-libdrm --enable-libudev \
         --enable-pic --enable-optimizations \
-        --extra-cflags="-I$LIBS_DIR/include" --extra-ldflags="-L$LIBS_DIR/lib" \
+        --extra-cflags="-I$LIBS_DIR/include -I/opt/linux-uapi/include" \
+        --extra-ldflags="-L$LIBS_DIR/lib" \
         "${cross_prefix_flags[@]+"${cross_prefix_flags[@]}"}"
 
     make -j"$JOBS"

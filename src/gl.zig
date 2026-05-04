@@ -71,6 +71,8 @@ const DRM_FORMAT_R8: u32 = fourcc('R', '8', ' ', ' ');
 const DRM_FORMAT_GR88: u32 = fourcc('G', 'R', '8', '8');
 const DRM_FORMAT_NV12: u32 = fourcc('N', 'V', '1', '2');
 
+const GL_TEXTURE_EXTERNAL_OES: c.GLenum = 0x8D65;
+
 const vert_src: [:0]const u8 =
     \\attribute vec2 a_pos;
     \\attribute vec2 a_uv;
@@ -99,6 +101,18 @@ const frag_src: [:0]const u8 =
     \\}
 ;
 
+const frag_ext_src: [:0]const u8 =
+    \\#extension GL_OES_EGL_image_external : require
+    \\precision mediump float;
+    \\varying vec2 v_uv;
+    \\uniform samplerExternalOES u_tex;
+    \\uniform vec4 u_crop;
+    \\void main() {
+    \\    vec2 uv = v_uv * u_crop.xy + u_crop.zw;
+    \\    gl_FragColor = texture2D(u_tex, uv);
+    \\}
+;
+
 const quad_verts = [_]f32{
     -1.0, -1.0, 0.0, 1.0,
     1.0,  -1.0, 1.0, 1.0,
@@ -120,6 +134,15 @@ pub const VideoRenderer = struct {
     u_tex_uv: c.GLint,
     u_crop: c.GLint,
     in_flight: ?*c.AVFrame,
+
+    program_ext: c.GLuint,
+    tex_ext: c.GLuint,
+    a_pos_ext: c.GLint,
+    a_uv_ext: c.GLint,
+    u_tex_ext: c.GLint,
+    u_crop_ext: c.GLint,
+    have_ext: bool,
+    ext_unavailable: bool,
 
     pub fn init(gl: GlCtx) !VideoRenderer {
         const vs = try compileShader(c.GL_VERTEX_SHADER, vert_src);
@@ -161,6 +184,19 @@ pub const VideoRenderer = struct {
         }
         c.glBindTexture(c.GL_TEXTURE_2D, 0);
 
+        const ext = initExternal(gl) catch ExternalProgram{};
+
+        var ext_tex: c.GLuint = 0;
+        if (ext.program != 0) {
+            c.glGenTextures(1, &ext_tex);
+            c.glBindTexture(GL_TEXTURE_EXTERNAL_OES, ext_tex);
+            c.glTexParameteri(GL_TEXTURE_EXTERNAL_OES, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+            c.glTexParameteri(GL_TEXTURE_EXTERNAL_OES, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+            c.glTexParameteri(GL_TEXTURE_EXTERNAL_OES, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+            c.glTexParameteri(GL_TEXTURE_EXTERNAL_OES, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+            c.glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+        }
+
         return .{
             .gl = gl,
             .program = prog,
@@ -173,6 +209,54 @@ pub const VideoRenderer = struct {
             .u_tex_uv = c.glGetUniformLocation(prog, "u_tex_uv"),
             .u_crop = c.glGetUniformLocation(prog, "u_crop"),
             .in_flight = null,
+            .program_ext = ext.program,
+            .tex_ext = ext_tex,
+            .a_pos_ext = ext.a_pos,
+            .a_uv_ext = ext.a_uv,
+            .u_tex_ext = ext.u_tex,
+            .u_crop_ext = ext.u_crop,
+            .have_ext = ext.program != 0,
+            .ext_unavailable = ext.program == 0,
+        };
+    }
+
+    const ExternalProgram = struct {
+        program: c.GLuint = 0,
+        a_pos: c.GLint = -1,
+        a_uv: c.GLint = -1,
+        u_tex: c.GLint = -1,
+        u_crop: c.GLint = -1,
+    };
+
+    fn initExternal(gl: GlCtx) !ExternalProgram {
+        _ = gl;
+        const gl_exts_raw = c.glGetString(c.GL_EXTENSIONS) orelse return error.NoExt;
+        const gl_exts = std.mem.span(@as([*:0]const u8, @ptrCast(gl_exts_raw)));
+        if (std.mem.indexOf(u8, gl_exts, "GL_OES_EGL_image_external") == null) return error.NoExt;
+
+        const vs = try compileShader(c.GL_VERTEX_SHADER, vert_src);
+        errdefer c.glDeleteShader(vs);
+        const fs = try compileShader(c.GL_FRAGMENT_SHADER, frag_ext_src);
+        errdefer c.glDeleteShader(fs);
+
+        const prog = c.glCreateProgram();
+        if (prog == 0) return error.GlProgramAlloc;
+        errdefer c.glDeleteProgram(prog);
+        c.glAttachShader(prog, vs);
+        c.glAttachShader(prog, fs);
+        c.glLinkProgram(prog);
+        var status: c.GLint = 0;
+        c.glGetProgramiv(prog, c.GL_LINK_STATUS, &status);
+        if (status == 0) return error.GlLinkFailed;
+        c.glDeleteShader(vs);
+        c.glDeleteShader(fs);
+
+        return .{
+            .program = prog,
+            .a_pos = c.glGetAttribLocation(prog, "a_pos"),
+            .a_uv = c.glGetAttribLocation(prog, "a_uv"),
+            .u_tex = c.glGetUniformLocation(prog, "u_tex"),
+            .u_crop = c.glGetUniformLocation(prog, "u_crop"),
         };
     }
 
@@ -186,6 +270,8 @@ pub const VideoRenderer = struct {
         c.glDeleteTextures(2, &texs);
         c.glDeleteBuffers(1, &self.vbo);
         c.glDeleteProgram(self.program);
+        if (self.tex_ext != 0) c.glDeleteTextures(1, &self.tex_ext);
+        if (self.program_ext != 0) c.glDeleteProgram(self.program_ext);
     }
 
     pub fn drawDrmFrame(
@@ -200,6 +286,15 @@ pub const VideoRenderer = struct {
         if (desc.nb_layers < 1) {
             self.releaseFrame(av_frame);
             return false;
+        }
+
+        if (self.have_ext and !self.ext_unavailable and
+            desc.nb_layers == 1 and desc.layers[0].format == DRM_FORMAT_NV12 and
+            desc.layers[0].nb_planes >= 2)
+        {
+            if (self.drawExternal(av_frame, desc, frame_w, frame_h, crop, viewport)) return true;
+            self.ext_unavailable = true;
+            std.log.info("external-OES path unavailable; falling back to split-plane", .{});
         }
 
         const Plane = struct { fd: c_int, offset: isize, pitch: isize, mod: u64, fc: u32 };
@@ -289,6 +384,7 @@ pub const VideoRenderer = struct {
 
             const img = self.gl.eglCreateImageKHR(self.gl.egl_display, c.EGL_NO_CONTEXT, c.EGL_LINUX_DMA_BUF_EXT, null, &attrs);
             if (img == null) {
+                std.log.warn("Dropping frame due to egl error: 0x{x}", .{c.eglGetError()});
                 self.releaseFrame(av_frame);
                 return false;
             }
@@ -324,6 +420,91 @@ pub const VideoRenderer = struct {
         c.glDisableVertexAttribArray(@intCast(self.a_pos));
         c.glDisableVertexAttribArray(@intCast(self.a_uv));
         c.glActiveTexture(c.GL_TEXTURE0);
+
+        if (self.in_flight) |prev| {
+            var p: ?*c.AVFrame = prev;
+            c.av_frame_free(&p);
+        }
+        self.in_flight = av_frame;
+        return true;
+    }
+
+    fn drawExternal(
+        self: *VideoRenderer,
+        av_frame: *c.AVFrame,
+        desc: *c.AVDRMFrameDescriptor,
+        frame_w: u32,
+        frame_h: u32,
+        crop: decode.Crop,
+        viewport: GlRect,
+    ) bool {
+        const layer = &desc.layers[0];
+        const py = &layer.planes[0];
+        const puv = &layer.planes[1];
+        const oy = &desc.objects[@intCast(py.object_index)];
+        const ouv = &desc.objects[@intCast(puv.object_index)];
+
+        var attrs: [30]c.EGLint = undefined;
+        var n: usize = 0;
+        attrs[n] = c.EGL_WIDTH; n += 1; attrs[n] = @intCast(frame_w); n += 1;
+        attrs[n] = c.EGL_HEIGHT; n += 1; attrs[n] = @intCast(frame_h); n += 1;
+        attrs[n] = c.EGL_LINUX_DRM_FOURCC_EXT; n += 1; attrs[n] = @bitCast(DRM_FORMAT_NV12); n += 1;
+
+        attrs[n] = c.EGL_DMA_BUF_PLANE0_FD_EXT; n += 1; attrs[n] = oy.fd; n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE0_OFFSET_EXT; n += 1; attrs[n] = @intCast(py.offset); n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE0_PITCH_EXT; n += 1; attrs[n] = @intCast(py.pitch); n += 1;
+
+        attrs[n] = c.EGL_DMA_BUF_PLANE1_FD_EXT; n += 1; attrs[n] = ouv.fd; n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE1_OFFSET_EXT; n += 1; attrs[n] = @intCast(puv.offset); n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE1_PITCH_EXT; n += 1; attrs[n] = @intCast(puv.pitch); n += 1;
+
+        if (self.gl.has_modifiers and oy.format_modifier != DRM_FORMAT_MOD_INVALID) {
+            attrs[n] = c.EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT; n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(oy.format_modifier))); n += 1;
+            attrs[n] = c.EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT; n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(oy.format_modifier >> 32))); n += 1;
+            attrs[n] = c.EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT; n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(ouv.format_modifier))); n += 1;
+            attrs[n] = c.EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT; n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(ouv.format_modifier >> 32))); n += 1;
+        }
+        attrs[n] = c.EGL_NONE;
+
+        const img = self.gl.eglCreateImageKHR(self.gl.egl_display, c.EGL_NO_CONTEXT, c.EGL_LINUX_DMA_BUF_EXT, null, &attrs);
+        if (img == null) {
+            std.log.warn("external-OES eglCreateImageKHR failed: 0x{x}", .{c.eglGetError()});
+            return false;
+        }
+        defer _ = self.gl.eglDestroyImageKHR(self.gl.egl_display, img);
+
+        c.glActiveTexture(c.GL_TEXTURE0);
+        c.glBindTexture(GL_TEXTURE_EXTERNAL_OES, self.tex_ext);
+        self.gl.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, @ptrCast(img));
+
+        const fw: f32 = @floatFromInt(frame_w);
+        const fh: f32 = @floatFromInt(frame_h);
+        const cw: f32 = @floatFromInt(frame_w - crop.left - crop.right);
+        const ch: f32 = @floatFromInt(frame_h - crop.top - crop.bottom);
+
+        c.glViewport(viewport.x, viewport.y, viewport.w, viewport.h);
+        c.glDisable(c.GL_BLEND);
+        c.glDisable(c.GL_DEPTH_TEST);
+        c.glDisable(c.GL_SCISSOR_TEST);
+        c.glUseProgram(self.program_ext);
+        c.glUniform1i(self.u_tex_ext, 0);
+        c.glUniform4f(self.u_crop_ext, cw / fw, ch / fh, @as(f32, @floatFromInt(crop.left)) / fw, @as(f32, @floatFromInt(crop.top)) / fh);
+
+        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+        c.glEnableVertexAttribArray(@intCast(self.a_pos_ext));
+        c.glVertexAttribPointer(@intCast(self.a_pos_ext), 2, c.GL_FLOAT, c.GL_FALSE, 16, null);
+        c.glEnableVertexAttribArray(@intCast(self.a_uv_ext));
+        c.glVertexAttribPointer(@intCast(self.a_uv_ext), 2, c.GL_FLOAT, c.GL_FALSE, 16, @ptrFromInt(8));
+
+        c.glDrawArrays(c.GL_TRIANGLE_STRIP, 0, 4);
+
+        c.glDisableVertexAttribArray(@intCast(self.a_pos_ext));
+        c.glDisableVertexAttribArray(@intCast(self.a_uv_ext));
+        c.glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
 
         if (self.in_flight) |prev| {
             var p: ?*c.AVFrame = prev;

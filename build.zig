@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
     mod.addObjectFile(b.path("libs/lib/libprotobuf-c.a"));
 
     // System libraries
+    mod.linkSystemLibrary("udev", .{});
     mod.linkSystemLibrary("drm", .{});
     mod.linkSystemLibrary("EGL", .{});
     mod.linkSystemLibrary("GLESv2", .{});

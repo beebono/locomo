@@ -466,8 +466,10 @@ fn beginStreaming(state: *AppState) !void {
     const toast_duration_ns: i128 = 4 * std.time.ns_per_s;
     const toast1_until_ns: i128 = Io.Clock.awake.now(io).toNanoseconds() + toast_duration_ns;
     const toast2_until_ns: i128 = Io.Clock.awake.now(io).toNanoseconds() + (toast_duration_ns * 2);
-    const toast_text_tip1: [:0]const u8 = "Hold Start + Select and double-tap West Button to disconnect";
+    const toast_text_tip1: [:0]const u8 = "Hold Start + Select and double-tap the X Button to disconnect";
     const toast_text_tip2: [:0]const u8 = "Hold Start + Select and click Left Stick to toggle mouse mode";
+    const toast_text_tip1_short: [:0]const u8 = "Start+Select+(X x2): Quit";
+    const toast_text_tip2_short: [:0]const u8 = "Start+Select+L3: Mouse Mode";
 
     var frame: decode.VideoFrame = undefined;
     while (!sess_ctx.disconnected.load(.acquire)) {
@@ -558,8 +560,13 @@ fn beginStreaming(state: *AppState) !void {
                                     break :blk null;
                                 };
                                 if (overlay != null) {
-                                    toast1_tex = gl.uploadText(state.ui.font_small, toast_text_tip1, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
-                                    toast2_tex = gl.uploadText(state.ui.font_small, toast_text_tip2, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                    if (state.ui.logical_w >= 1600) {
+                                        toast1_tex = gl.uploadText(state.ui.font_small, toast_text_tip1, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                        toast2_tex = gl.uploadText(state.ui.font_small, toast_text_tip2, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                    } else {
+                                        toast1_tex = gl.uploadText(state.ui.font_small, toast_text_tip1_short, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                        toast2_tex = gl.uploadText(state.ui.font_small, toast_text_tip2_short, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                    }
                                 }
                             }
                         }
@@ -595,7 +602,7 @@ fn beginStreaming(state: *AppState) !void {
                 // SW path uses SDL for overlays and doesn't support mouse mode
                 const now_ns = Io.Clock.awake.now(io).toNanoseconds();
                 if (now_ns < toast1_until_ns) {
-                    state.ui.drawToast(toast_text_tip1);
+                    if (state.ui.logical_w >= 1600) state.ui.drawToast(toast_text_tip1) else state.ui.drawToast(toast_text_tip1_short);
                 }
             }
 

@@ -297,6 +297,12 @@ fn openCandidate(w: c_int, h: c_int, extradata: ?[]const u8, name: [*:0]const u8
         cc.*.get_format = getDrmFormat;
         cc.*.pix_fmt = c.AV_PIX_FMT_DRM_PRIME;
     }
+    if (hw_type == c.AV_HWDEVICE_TYPE_V4L2REQUEST) {
+        if (c.av_hwdevice_ctx_create(&cc.*.hw_device_ctx, hw_type, null, null, 0) < 0) {
+            c.avcodec_free_context(@ptrCast(@constCast(&cc)));
+            return null;
+        }
+    }
     if (c.avcodec_open2(cc, codec, null) < 0) {
         c.avcodec_free_context(@ptrCast(@constCast(&cc)));
         return null;
@@ -326,9 +332,11 @@ fn selectCodec(codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extra
     const is_hevc = codec_id == c.AV_CODEC_ID_HEVC;
     const hw_candidates: []const Candidate = if (is_hevc) &.{
         .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
+        .{ .name = "hevc", .hw_type = c.AV_HWDEVICE_TYPE_V4L2REQUEST },
         .{ .name = "hevc_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
     } else &.{
         .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
+        .{ .name = "h264", .hw_type = c.AV_HWDEVICE_TYPE_V4L2REQUEST },
         .{ .name = "h264_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
     };
     if (hw_decode) {

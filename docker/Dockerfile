@@ -13,7 +13,7 @@ deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-security main restri
 
 RUN apt-get update && apt-get install -y \
     build-essential cmake make nasm pkg-config git curl xz-utils \
-    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    rsync gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
     libdbus-1-dev:arm64 libibus-1.0-dev:arm64 libudev-dev:arm64 \
     libegl-dev:arm64 libgles-dev:arm64 \
     libdrm-dev:arm64 libgbm-dev:arm64 libpulse-dev:arm64 \
@@ -23,10 +23,18 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Cross pkg-config wrapper for aarch64
-# Preserves PKG_CONFIG_LIBDIR from the caller (for local libs) and appends system paths.
 RUN printf '#!/bin/sh\nPKG_CONFIG_PATH="" PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:+$PKG_CONFIG_LIBDIR:}/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" pkg-config "$@"\n' \
     > /usr/local/bin/aarch64-linux-gnu-pkg-config && \
     chmod +x /usr/local/bin/aarch64-linux-gnu-pkg-config
+
+# Updated headers for ffmpeg/v4l2-request
+RUN set -eux; \
+    cd /tmp; \
+    curl -fsSLO https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz; \
+    tar xf linux-6.6.tar.xz; \
+    cd linux-6.6; \
+    make headers_install ARCH=arm64 INSTALL_HDR_PATH=/opt/linux-uapi; \
+    cd / && rm -rf /tmp/linux-6.6*
 
 RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ -C /opt && \

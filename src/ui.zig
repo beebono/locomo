@@ -3,7 +3,7 @@ const c = @import("c.zig").c;
 const config = @import("config.zig");
 const gl = @import("gl.zig");
 
-const FONT_SIZE = 64;
+const FONT_BIG = 64;
 const FONT_SMALL = 48;
 
 const COLOR_BG = c.SDL_Color{ .r = 15, .g = 15, .b = 30, .a = 255 };
@@ -80,10 +80,12 @@ pub const Ui = struct {
             if (c.SDL_IsGameController(ci) != 0) _ = c.SDL_GameControllerOpen(ci);
         }
 
-        const font = c.TTF_OpenFont("assets/Asap-Medium.otf", FONT_SIZE) orelse return error.OpenFontFailed;
+        const size_big = @as(c_int, @intFromFloat(@round(FONT_BIG * @as(f32, @floatFromInt(screen_h)) / 1080.0)));
+        const font = c.TTF_OpenFont("assets/Asap-Medium.otf", size_big) orelse return error.OpenFontFailed;
         errdefer c.TTF_CloseFont(font);
 
-        const font_small = c.TTF_OpenFont("assets/Asap-Medium.otf", FONT_SMALL) orelse return error.OpenFontFailed;
+        const size_small = @as(c_int, @intFromFloat(@round(FONT_SMALL * @as(f32, @floatFromInt(screen_h)) / 1080.0)));
+        const font_small = c.TTF_OpenFont("assets/Asap-Medium.otf", size_small) orelse return error.OpenFontFailed;
 
         return Ui{
             .window = window,
