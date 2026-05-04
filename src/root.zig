@@ -98,7 +98,6 @@ var session_callbacks = c.IHS_StreamSessionCallbacks{
 
 const AppState = struct {
     allocator: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
     phase: Phase,
     device: config.DeviceConfig,
     paired: ?config.PairedHost,
@@ -124,7 +123,6 @@ fn initAppState(allocator: std.mem.Allocator) !AppState {
 
     return AppState{
         .allocator = allocator,
-        .arena = std.heap.ArenaAllocator.init(allocator),
         .phase = .scan,
         .device = device,
         .paired = paired,
@@ -138,7 +136,6 @@ fn initAppState(allocator: std.mem.Allocator) !AppState {
 fn deinitAppState(state: *AppState) void {
     state.decode_ctx.deinit();
     state.ui.deinit();
-    state.arena.deinit();
 }
 
 fn drawGlToast(overlay: *gl.OverlayRenderer, text: gl.TextureRef, vp_w: c_int, vp_h: c_int) void {
@@ -249,7 +246,7 @@ fn scanForHosts(state: *AppState) void {
         const scanning = !disc_ctx.done.load(.acquire);
         state.ui.drawScanScreen(hosts, scanning);
 
-        const ev = state.ui.pollEvents(state.settings.button_swap);
+        const ev = input.pollEvents(state.settings.button_swap);
         switch (ev) {
             .quit => {
                 state.phase = .quit;
@@ -270,6 +267,7 @@ fn scanForHosts(state: *AppState) void {
             },
             .dpad_up => state.ui.moveScanCursor(-1, hosts.len),
             .dpad_down => state.ui.moveScanCursor(1, hosts.len),
+            // rescan when no hosts are available
             .button_a => {
                 const idx = state.ui.selectedHostIndex();
                 if (idx < hosts.len) {
@@ -280,7 +278,7 @@ fn scanForHosts(state: *AppState) void {
                     else
                         .pair;
                     return;
-                } else if (disc_ctx.done.load(.acquire)) {
+                } else if (idx >= hosts.len and disc_ctx.done.load(.acquire)) {
                     disc_ctx.stop();
                     return;
                 }
@@ -310,7 +308,7 @@ fn pairWithPin(state: *AppState) !void {
 
     while (!auth_ctx.done.load(.acquire)) {
         state.ui.drawPinDisplay(&pin);
-        switch (state.ui.pollEvents(state.settings.button_swap)) {
+        switch (input.pollEvents(state.settings.button_swap)) {
             .quit => {
                 state.phase = .quit;
                 auth_ctx.stop();
@@ -421,10 +419,9 @@ fn beginStreaming(state: *AppState) !void {
         return;
     }
 
-    // Gamepad input passthrough, defer until connected or else the
+    // Flag to defer gamepad input passthrough until connected or else the
     // Host will immediately refuse the connection thinking something went wrong.
     var hid_initialized = false;
-    defer if (hid_initialized) input.deinit();
 
     // Heartbeat to suppress Steam's idle-gamepad timeout
     const heartbeat_interval_ns: i128 = 30 * std.time.ns_per_s;
@@ -466,10 +463,8 @@ fn beginStreaming(state: *AppState) !void {
     const toast_duration_ns: i128 = 4 * std.time.ns_per_s;
     const toast1_until_ns: i128 = Io.Clock.awake.now(io).toNanoseconds() + toast_duration_ns;
     const toast2_until_ns: i128 = Io.Clock.awake.now(io).toNanoseconds() + (toast_duration_ns * 2);
-    const toast_text_tip1: [:0]const u8 = "Hold Start + Select and double-tap the X Button to disconnect";
-    const toast_text_tip2: [:0]const u8 = "Hold Start + Select and click Left Stick to toggle mouse mode";
-    const toast_text_tip1_short: [:0]const u8 = "Start+Select+(X x2): Quit";
-    const toast_text_tip2_short: [:0]const u8 = "Start+Select+L3: Mouse Mode";
+    const toast_text_tip1: [:0]const u8 = if (state.ui.logical_w >= 1600) "Hold Start + Select and double-tap the X Button to disconnect" else "Start+Select+(X x2): Quit";
+    const toast_text_tip2: [:0]const u8 = if (state.ui.logical_w >= 1600) "Hold Start + Select and click Left Stick to toggle mouse mode" else "Start+Select+L3: Mouse Mode";
 
     var frame: decode.VideoFrame = undefined;
     while (!sess_ctx.disconnected.load(.acquire)) {
@@ -555,7 +550,7 @@ fn beginStreaming(state: *AppState) !void {
                         cursor_state.renderSdl(state.ui.renderer, dst, last_host_w, last_host_h, mouse_mode);
                     }
                 },
-                .drm => |*drm| {
+                .drm => {
                     if (video_renderer == null) {
                         if (state.ui.gl_ctx) |gctx| {
                             video_renderer = gl.VideoRenderer.init(gctx) catch blk: {
@@ -566,13 +561,8 @@ fn beginStreaming(state: *AppState) !void {
                                     break :blk null;
                                 };
                                 if (overlay != null) {
-                                    if (state.ui.logical_w >= 1600) {
-                                        toast1_tex = gl.uploadText(state.ui.font_small, toast_text_tip1, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
-                                        toast2_tex = gl.uploadText(state.ui.font_small, toast_text_tip2, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
-                                    } else {
-                                        toast1_tex = gl.uploadText(state.ui.font_small, toast_text_tip1_short, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
-                                        toast2_tex = gl.uploadText(state.ui.font_small, toast_text_tip2_short, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
-                                    }
+                                    toast1_tex = gl.uploadText(state.ui.font_small, toast_text_tip1, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
+                                    toast2_tex = gl.uploadText(state.ui.font_small, toast_text_tip2, .{ .r = 220, .g = 220, .b = 220, .a = 255 });
                                 }
                             }
                         }
@@ -587,10 +577,7 @@ fn beginStreaming(state: *AppState) !void {
                         }
                         last_host_w = cropped_w;
                         last_host_h = cropped_h;
-                        const owned = drm.av_frame;
-                        drm.av_frame = undefined;
-                        frame.payload = .{ .sw = .{ .y = &.{}, .uv = &.{}, .y_stride = 0, .uv_stride = 0, .allocator = state.allocator } };
-                        _ = vr.drawDrmFrame(owned, frame.width, frame.height, frame.crop, vp);
+                        _ = vr.drawDrmFrame(frame.takeDrm(), frame.width, frame.height, frame.crop, vp);
 
                         if (overlay) |*o| {
                             var ow: c_int = 0;
@@ -611,9 +598,9 @@ fn beginStreaming(state: *AppState) !void {
                 // SW path uses SDL for overlays
                 const now_ns = Io.Clock.awake.now(io).toNanoseconds();
                 if (now_ns < toast1_until_ns) {
-                    if (state.ui.logical_w >= 1600) state.ui.drawToast(toast_text_tip1) else state.ui.drawToast(toast_text_tip1_short);
+                    state.ui.drawToast(toast_text_tip1);
                 } else if (now_ns < toast2_until_ns) {
-                    if (state.ui.logical_w >= 1600) state.ui.drawToast(toast_text_tip2) else state.ui.drawToast(toast_text_tip2_short);
+                    state.ui.drawToast(toast_text_tip2);
                 }
             }
 
@@ -643,7 +630,7 @@ fn settingsScreen(state: *AppState) void {
 
     while (true) {
         state.ui.drawSettingsScreen(s);
-        switch (state.ui.pollEvents(state.settings.button_swap)) {
+        switch (input.pollEvents(state.settings.button_swap)) {
             .quit => {
                 state.phase = .quit;
                 return;
@@ -668,19 +655,8 @@ fn settingsScreen(state: *AppState) void {
 
 fn waitForA(state: *AppState) void {
     while (true) {
-        switch (state.ui.pollEvents(state.settings.button_swap)) {
+        switch (input.pollEvents(state.settings.button_swap)) {
             .button_a, .quit => return,
-            else => {},
-        }
-        io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
-    }
-}
-
-fn waitForAorB(state: *AppState) ui_mod.UiEvent {
-    while (true) {
-        const ev = state.ui.pollEvents(state.settings.button_swap);
-        switch (ev) {
-            .button_a, .button_b, .quit => return ev,
             else => {},
         }
         io.sleep(.fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
@@ -690,7 +666,7 @@ fn waitForAorB(state: *AppState) ui_mod.UiEvent {
 fn confirmQuit(state: *AppState) bool {
     state.ui.drawStatus("Press Start to quit or B to resume.");
     while (true) {
-        switch (state.ui.pollEvents(state.settings.button_swap)) {
+        switch (input.pollEvents(state.settings.button_swap)) {
             .button_start, .quit => return true,
             .button_b => return false,
             else => {},

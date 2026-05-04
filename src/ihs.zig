@@ -120,16 +120,6 @@ const AuthArgs = struct {
     pin: [5]u8,
 };
 
-fn onAuthProgress(
-    client: ?*c.IHS_Client,
-    host: ?*const c.IHS_HostInfo,
-    ctx_ptr: ?*anyopaque,
-) callconv(.c) void {
-    _ = client;
-    _ = host;
-    _ = ctx_ptr;
-}
-
 fn onAuthSuccess(
     client: ?*c.IHS_Client,
     host: ?*const c.IHS_HostInfo,
@@ -158,7 +148,7 @@ fn onAuthFailed(
 }
 
 var auth_callbacks = c.IHS_ClientAuthorizationCallbacks{
-    .progress = onAuthProgress,
+    .progress = null,
     .success = onAuthSuccess,
     .failed = onAuthFailed,
 };
@@ -219,16 +209,6 @@ const StreamArgs = struct {
     audio_channels: i32,
 };
 
-fn onStreamProgress(
-    client: ?*c.IHS_Client,
-    host: ?*const c.IHS_HostInfo,
-    ctx_ptr: ?*anyopaque,
-) callconv(.c) void {
-    _ = client;
-    _ = host;
-    _ = ctx_ptr;
-}
-
 fn onStreamSuccess(
     client: ?*c.IHS_Client,
     host: ?*const c.IHS_HostInfo,
@@ -262,7 +242,7 @@ fn onStreamFailed(
 }
 
 var stream_callbacks = c.IHS_ClientStreamingCallbacks{
-    .progress = onStreamProgress,
+    .progress = null,
     .success = onStreamSuccess,
     .failed = onStreamFailed,
 };

@@ -112,7 +112,7 @@ pub const SwFrame = struct {
 };
 
 pub const DrmFrame = struct {
-    av_frame: *c.AVFrame,
+    av_frame: ?*c.AVFrame,
 };
 
 pub const VideoFrame = struct {
@@ -130,11 +130,17 @@ pub const VideoFrame = struct {
                 f.allocator.free(f.y);
                 f.allocator.free(f.uv);
             },
-            .drm => |*f| {
-                var p: ?*c.AVFrame = f.av_frame;
+            .drm => |*f| if (f.av_frame) |fr| {
+                var p: ?*c.AVFrame = fr;
                 c.av_frame_free(&p);
             },
         }
+    }
+
+    pub fn takeDrm(self: *VideoFrame) *c.AVFrame {
+        const owned = self.payload.drm.av_frame.?;
+        self.payload.drm.av_frame = null;
+        return owned;
     }
 };
 
@@ -218,17 +224,7 @@ pub const DecodeCtx = struct {
     }
 
     pub fn deinit(self: *DecodeCtx) void {
-        if (self.video_ring) |*r| r.requestStop();
-        if (self.video_thread) |t| {
-            const deadline_ms: i64 = 250;
-            const start_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-            while (!self.thread_exited.load(.acquire)) {
-                if (std.Io.Clock.awake.now(io).toMilliseconds() - start_ms > deadline_ms) break;
-                io.sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
-            }
-            if (self.thread_exited.load(.acquire)) t.join() else t.detach();
-            self.video_thread = null;
-        }
+        self.teardownVideoThread();
         if (self.thread_exited.load(.acquire)) {
             if (self.video_ring) |*r| {
                 r.deinit();
@@ -237,14 +233,44 @@ pub const DecodeCtx = struct {
         }
         if (self.pending_frame) |*f| f.deinit();
         self.pending_frame = null;
-        if (self.thread_exited.load(.acquire)) {
+        if (self.audio_swr_ctx) |s| c.swr_free(@ptrCast(@constCast(&s)));
+        if (self.audio_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
+    }
+
+    fn publish(self: *DecodeCtx, new_frame: VideoFrame) void {
+        {
+            self.frame_mutex.lockUncancelable(io);
+            defer self.frame_mutex.unlock(io);
+            if (self.pending_frame) |*old| old.deinit();
+            self.pending_frame = new_frame;
+            self.frame_ready = true;
+        }
+        self.frame_event.set(io);
+    }
+
+    fn teardownVideoThread(self: *DecodeCtx) void {
+        if (self.video_ring) |*r| r.requestStop();
+        const join_deadline_ms: i64 = 250;
+        const start_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+        while (!self.thread_exited.load(.acquire)) {
+            if (std.Io.Clock.awake.now(io).toMilliseconds() - start_ms > join_deadline_ms) break;
+            io.sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
+        }
+        const exited = self.thread_exited.load(.acquire);
+        if (self.video_thread) |t| {
+            if (exited) t.join() else t.detach();
+            self.video_thread = null;
+        }
+        if (exited) {
             if (self.av_sw_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
             if (self.av_frame) |f| c.av_frame_free(@ptrCast(@constCast(&f)));
             if (self.parser) |p| c.av_parser_close(p);
-            if (self.video_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
+            if (self.video_codec_ctx) |cc| c.avcodec_free_context(@ptrCast(@constCast(&cc)));
         }
-        if (self.audio_swr_ctx) |s| c.swr_free(@ptrCast(@constCast(&s)));
-        if (self.audio_codec_ctx) |ctx| c.avcodec_free_context(@ptrCast(@constCast(&ctx)));
+        self.av_sw_frame = null;
+        self.av_frame = null;
+        self.parser = null;
+        self.video_codec_ctx = null;
     }
 
     pub fn waitNextFrame(self: *DecodeCtx, out: *VideoFrame, timeout: std.Io.Timeout) bool {
@@ -415,6 +441,15 @@ fn videoSetCaptureSize(
     return 0;
 }
 
+fn tripFailsafe(ctx: *DecodeCtx, now_ms: i64) bool {
+    const failsafe_ms: i64 = 1000;
+    if (ctx.submit_stuck_since_ms == 0) {
+        ctx.submit_stuck_since_ms = now_ms;
+        return false;
+    }
+    return now_ms - ctx.submit_stuck_since_ms > failsafe_ms;
+}
+
 fn videoSubmit(
     session: ?*c.IHS_Session,
     data: ?*c.IHS_Buffer,
@@ -429,19 +464,7 @@ fn videoSubmit(
     const data_ptr = c.IHS_BufferPointer(buf);
     const data_len = buf.size;
     const is_keyframe = (flags & c.IHS_StreamVideoFrameKeyFrame) != 0;
-
-    const failsafe_ms: i64 = 1000;
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-
-    const tripFailsafe = struct {
-        fn call(c_ctx: *DecodeCtx, now: i64) bool {
-            if (c_ctx.submit_stuck_since_ms == 0) {
-                c_ctx.submit_stuck_since_ms = now;
-                return false;
-            }
-            return now - c_ctx.submit_stuck_since_ms > failsafe_ms;
-        }
-    }.call;
 
     if (ctx.need_keyframe.load(.acquire)) {
         if (!is_keyframe) {
@@ -482,17 +505,7 @@ fn populateFrame(ctx: *DecodeCtx) bool {
             },
             .payload = .{ .drm = .{ .av_frame = cloned } },
         };
-        {
-            ctx.frame_mutex.lockUncancelable(io);
-            defer ctx.frame_mutex.unlock(io);
-            if (ctx.frame_ready) {
-                if (ctx.pending_frame) |*old| old.deinit();
-                ctx.pending_frame = null;
-            }
-            ctx.pending_frame = new_frame;
-            ctx.frame_ready = true;
-        }
-        ctx.frame_event.set(io);
+        ctx.publish(new_frame);
         return true;
     }
 
@@ -579,18 +592,7 @@ fn populateFrame(ctx: *DecodeCtx) bool {
             .allocator = ctx.allocator,
         } },
     };
-
-    {
-        ctx.frame_mutex.lockUncancelable(io);
-        defer ctx.frame_mutex.unlock(io);
-        if (ctx.frame_ready) {
-            if (ctx.pending_frame) |*old| old.deinit();
-            ctx.pending_frame = null;
-        }
-        ctx.pending_frame = new_frame;
-        ctx.frame_ready = true;
-    }
-    ctx.frame_event.set(io);
+    ctx.publish(new_frame);
     return true;
 }
 
@@ -715,48 +717,7 @@ fn videoStop(
 ) callconv(.c) void {
     _ = session;
     const ctx: *DecodeCtx = @ptrCast(@alignCast(ctx_ptr.?));
-
-    if (ctx.video_ring) |*r| r.requestStop();
-
-    const join_deadline_ms: i64 = 250;
-    const poll_interval_ns: u64 = 5 * std.time.ns_per_ms;
-    const start_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-    while (!ctx.thread_exited.load(.acquire)) {
-        if (std.Io.Clock.awake.now(io).toMilliseconds() - start_ms > join_deadline_ms) break;
-        io.sleep(.fromNanoseconds(poll_interval_ns), .awake) catch {};
-    }
-
-    if (ctx.thread_exited.load(.acquire)) {
-        if (ctx.video_thread) |t| {
-            t.join();
-            ctx.video_thread = null;
-        }
-        if (ctx.av_sw_frame) |f| {
-            c.av_frame_free(@ptrCast(@constCast(&f)));
-            ctx.av_sw_frame = null;
-        }
-        if (ctx.av_frame) |f| {
-            c.av_frame_free(@ptrCast(@constCast(&f)));
-            ctx.av_frame = null;
-        }
-        if (ctx.parser) |p| {
-            c.av_parser_close(p);
-            ctx.parser = null;
-        }
-        if (ctx.video_codec_ctx) |cc| {
-            c.avcodec_free_context(@ptrCast(@constCast(&cc)));
-            ctx.video_codec_ctx = null;
-        }
-    } else {
-        if (ctx.video_thread) |t| {
-            t.detach();
-            ctx.video_thread = null;
-        }
-        ctx.av_sw_frame = null;
-        ctx.av_frame = null;
-        ctx.parser = null;
-        ctx.video_codec_ctx = null;
-    }
+    ctx.teardownVideoThread();
 }
 
 // Callbacks: Audio

@@ -2,7 +2,6 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const config = @import("config.zig");
 const gl = @import("gl.zig");
-const input = @import("input.zig");
 
 const FONT_BIG = 64;
 const FONT_SMALL = 48;
@@ -11,20 +10,7 @@ const COLOR_BG = c.SDL_Color{ .r = 15, .g = 15, .b = 30, .a = 255 };
 const COLOR_FG = c.SDL_Color{ .r = 220, .g = 220, .b = 220, .a = 255 };
 const COLOR_SEL = c.SDL_Color{ .r = 80, .g = 140, .b = 240, .a = 255 };
 const COLOR_DIM = c.SDL_Color{ .r = 100, .g = 100, .b = 120, .a = 255 };
-const COLOR_OK = c.SDL_Color{ .r = 80, .g = 200, .b = 100, .a = 255 };
 const COLOR_ERR = c.SDL_Color{ .r = 220, .g = 60, .b = 60, .a = 255 };
-
-pub const UiEvent = enum {
-    none,
-    dpad_up,
-    dpad_down,
-    dpad_left,
-    dpad_right,
-    button_a,
-    button_b,
-    button_start,
-    quit,
-};
 
 pub const PinStatus = enum { idle, waiting, denied, failed };
 
@@ -118,41 +104,6 @@ pub const Ui = struct {
         c.SDL_DestroyWindow(self.window);
         c.TTF_Quit();
         c.SDL_Quit();
-    }
-
-    pub fn pollEvents(self: *Ui, swap: config.ButtonSwap) UiEvent {
-        _ = self;
-        var event: c.SDL_Event = undefined;
-        while (c.SDL_PollEvent(&event) != 0) {
-            switch (event.type) {
-                c.SDL_QUIT => return .quit,
-                c.SDL_CONTROLLERDEVICEADDED => {
-                    _ = c.SDL_GameControllerOpen(event.cdevice.which);
-                },
-                c.SDL_CONTROLLERBUTTONDOWN => {
-                    const btn = input.swapButton(event.cbutton.button, swap);
-                    if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_UP) return .dpad_up;
-                    if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_DOWN) return .dpad_down;
-                    if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_LEFT) return .dpad_left;
-                    if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_RIGHT) return .dpad_right;
-                    if (btn == c.SDL_CONTROLLER_BUTTON_A) return .button_a;
-                    if (btn == c.SDL_CONTROLLER_BUTTON_B) return .button_b;
-                    if (btn == c.SDL_CONTROLLER_BUTTON_START) return .button_start;
-                },
-                c.SDL_KEYDOWN => {
-                    const sym = event.key.keysym.sym;
-                    if (sym == c.SDLK_UP) return .dpad_up;
-                    if (sym == c.SDLK_DOWN) return .dpad_down;
-                    if (sym == c.SDLK_LEFT) return .dpad_left;
-                    if (sym == c.SDLK_RIGHT) return .dpad_right;
-                    if (sym == c.SDLK_RETURN or sym == c.SDLK_z) return .button_a;
-                    if (sym == c.SDLK_x or sym == c.SDLK_ESCAPE) return .button_b;
-                    if (sym == c.SDLK_RETURN) return .button_start;
-                },
-                else => {},
-            }
-        }
-        return .none;
     }
 
     fn clear(self: *Ui) void {
@@ -310,7 +261,7 @@ pub const Ui = struct {
             _ = c.SDL_RenderCopy(self.renderer, tex, null, &c.SDL_Rect{ .x = cx, .y = cy, .w = tw, .h = th });
         }
 
-        const status_y: i32 = @divTrunc(self.logical_w, 3) + @divTrunc(self.logical_w, 6);
+        const status_y: i32 = @divTrunc(self.logical_h, 3) + @divTrunc(self.logical_h, 6);
         switch (self.pin_status) {
             .idle, .waiting => self.renderTextCentered("Waiting for PC confirmation...  B = cancel", status_y, COLOR_DIM, self.font_small),
             .denied => self.renderTextCentered("PIN denied.", status_y, COLOR_ERR, self.font_small),

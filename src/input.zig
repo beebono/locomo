@@ -5,18 +5,10 @@ const config = @import("config.zig");
 const Io = std.Io;
 const io = std.Options.debug_io;
 
-var hid_provider: ?*c.IHS_HIDProvider = null;
-
 pub fn init(session: *c.IHS_Session) void {
     const provider = c.IHS_HIDProviderSDLCreateManaged() orelse return;
-    hid_provider = provider;
     c.IHS_SessionHIDAddProvider(session, provider);
     _ = c.IHS_SessionHIDNotifyDeviceChange(session);
-}
-
-pub fn deinit() void {
-    // Freeing already handled by session, just remove the reference.
-    hid_provider = null;
 }
 
 pub fn swapButton(button: u8, swap: config.ButtonSwap) u8 {
@@ -29,6 +21,52 @@ pub fn swapButton(button: u8, swap: config.ButtonSwap) u8 {
         c.SDL_CONTROLLER_BUTTON_Y => if (xy) c.SDL_CONTROLLER_BUTTON_X else button,
         else => button,
     };
+}
+
+pub const Event = enum {
+    none,
+    dpad_up,
+    dpad_down,
+    dpad_left,
+    dpad_right,
+    button_a,
+    button_b,
+    button_start,
+    quit,
+};
+
+pub fn pollEvents(swap: config.ButtonSwap) Event {
+    var event: c.SDL_Event = undefined;
+    while (c.SDL_PollEvent(&event) != 0) {
+        switch (event.type) {
+            c.SDL_QUIT => return .quit,
+            c.SDL_CONTROLLERDEVICEADDED => {
+                _ = c.SDL_GameControllerOpen(event.cdevice.which);
+            },
+            c.SDL_CONTROLLERBUTTONDOWN => {
+                const btn = swapButton(event.cbutton.button, swap);
+                if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_UP) return .dpad_up;
+                if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_DOWN) return .dpad_down;
+                if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_LEFT) return .dpad_left;
+                if (btn == c.SDL_CONTROLLER_BUTTON_DPAD_RIGHT) return .dpad_right;
+                if (btn == c.SDL_CONTROLLER_BUTTON_A) return .button_a;
+                if (btn == c.SDL_CONTROLLER_BUTTON_B) return .button_b;
+                if (btn == c.SDL_CONTROLLER_BUTTON_START) return .button_start;
+            },
+            c.SDL_KEYDOWN => {
+                const sym = event.key.keysym.sym;
+                if (sym == c.SDLK_UP) return .dpad_up;
+                if (sym == c.SDLK_DOWN) return .dpad_down;
+                if (sym == c.SDLK_LEFT) return .dpad_left;
+                if (sym == c.SDLK_RIGHT) return .dpad_right;
+                if (sym == c.SDLK_RETURN or sym == c.SDLK_z) return .button_a;
+                if (sym == c.SDLK_x or sym == c.SDLK_ESCAPE) return .button_b;
+                if (sym == c.SDLK_s) return .button_start;
+            },
+            else => {},
+        }
+    }
+    return .none;
 }
 
 pub fn handleEvent(session: *c.IHS_Session, event: *const c.SDL_Event, swap: config.ButtonSwap) bool {
@@ -55,7 +93,7 @@ pub const MouseState = struct {
 
     const deadzone: f32 = 8000.0;
     const max_axis: f32 = 32767.0;
-    const max_pixels_per_sec: f32 = 1500.0;
+    const max_pixels_per_sec: f32 = 1200.0;
     const max_wheel_ticks_per_sec: f32 = 15.0;
     const exponent: f32 = 2.0;
     const trigger_press_threshold: i16 = 18000;
