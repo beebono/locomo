@@ -189,6 +189,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    exe.lto = .thin;
+    exe.link_gc_sections = true;
+
     const mod = exe.root_module;
 
     // Multiarch/Cross handling
