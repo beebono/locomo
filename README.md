@@ -142,6 +142,8 @@ Delete `paired.json` to unpair from the current host.
 | [protobuf-c](https://github.com/protobuf-c/protobuf-c) | Protobuf serialization for the IHS protocol |
 | [libudev-zero](https://github.com/illiliti/libudev-zero) | Minimal udev stub (static, no systemd dependency) |
 
+See `LICENSES` directory for applicable licensing details
+
 ## Special thanks!
 
 This project uses the work from following developers/projects. Without them, this wouldn't be here!
