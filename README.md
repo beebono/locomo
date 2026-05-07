@@ -23,7 +23,6 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 - ARM64 Linux (aarch64)
 - VPU hardware for video decoding (software decoding also available)
 - EGL and OpenGL ES 2.0 for zero-copy DRM frame rendering
-- `libSDL2` available on the system
 - A Steam host on the same local network with Remote Play enabled
 
 ### Build (Docker path - recommended)
@@ -34,8 +33,8 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 ### Build (native / manual path)
 
 - Zig 0.16.0
-- `cmake`, `make`, `nasm`, `pkg-config`, `autoconf`, `automake`, `libtool`, `meson`, `ninja-build`
-- ARM64 sysroot with: `libdbus`, `libibus`, `libegl`, `libgles`, `libgbm`, `libpulse`, `libwayland`, `libxkbcommon`
+- `wayland-scanner++`
+- ARM64 sysroot with: `libdbus`, `libibus`, `libdrm`, `libegl`, `libgles`, `libgbm`, `libasound2`, `libpulse`, `libwayland`, `libwayland-egl`, `libxkbcommon`, `libX11`, `libxext`, `libxrandr`, `libxcursor`, `libxi`
 
 ## Building
 
@@ -49,7 +48,7 @@ cd locomo
 ### Docker (cross-compile for aarch64 - recommended)
 
 ```sh
-./scripts/docker-build.sh
+./docker-build.sh
 ```
 
 This builds a Docker image with the full cross-compilation toolchain, bootstraps all library dependencies, then compiles locomo. The output binary is placed at:
@@ -61,7 +60,7 @@ This builds a Docker image with the full cross-compilation toolchain, bootstraps
 To target a different architecture, set `TARGET` before running:
 
 ```sh
-TARGET=aarch64-linux-gnu ./scripts/docker-build.sh
+TARGET=aarch64-linux-gnu ./docker-build.sh
 ```
 
 Please note this is unlikely to work for targets other than aarch64 at the moment!
@@ -69,7 +68,6 @@ Please note this is unlikely to work for targets other than aarch64 at the momen
 ### Native (on-device or with a matching sysroot)
 
 ```sh
-./scripts/bootstrap.sh
 zig build -Doptimize=ReleaseFast
 ```
 
