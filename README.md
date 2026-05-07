@@ -133,10 +133,10 @@ Delete `paired.json` to unpair from the current host.
 
 | Library | Purpose |
 |---|---|
-| [ihslib](https://github.com/beebono/ihslib) | Steam IHS protocol implementation |
+| [ihslib](https://github.com/mariotaku/ihslib) | Steam IHS protocol implementation |
 | [SDL2](https://github.com/libsdl-org/SDL) | Window, renderer, gamepad input |
 | [SDL2\_ttf](https://github.com/libsdl-org/SDL_ttf) | Font rendering for the UI |
-| [FFmpeg 8.1](https://ffmpeg.org) | Video/audio demuxing and decoding |
+| [FFmpeg](https://ffmpeg.org) | Video/audio demuxing and decoding |
 | [Rockchip MPP](https://github.com/rockchip-linux/mpp) | Hardware video decoding on Rockchip SoCs |
 | [mbedTLS](https://github.com/Mbed-TLS/mbedtls) | Cryptography (stream encryption) |
 | [protobuf-c](https://github.com/protobuf-c/protobuf-c) | Protobuf serialization for the IHS protocol |

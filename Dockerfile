@@ -28,19 +28,14 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\
 ' > /etc/apt/sources.list.d/ubuntu.sources
 
 RUN apt-get update && apt-get install -y \
-    build-essential cmake make nasm pkg-config meson \
-    ninja-build autoconf automake libtool git curl xz-utils \
-    libdbus-1-dev:arm64 libibus-1.0-dev:arm64 libpulse-dev:arm64 \
+    curl xz-utils wayland-scanner++ \
+    libdbus-1-dev:arm64 libibus-1.0-dev:arm64 \
+    libdrm-dev:arm64 libpulse-dev:arm64 libasound2-dev:arm64 \
     libegl-dev:arm64 libgles-dev:arm64 libgbm-dev:arm64 \
     libwayland-dev:arm64 libwayland-egl-backend-dev:arm64 \
     libxkbcommon-dev:arm64 libx11-dev:arm64 libxext-dev:arm64 \
     libxrandr-dev:arm64 libxcursor-dev:arm64 libxi-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
-
-# Cross pkg-config wrapper for aarch64
-RUN printf '#!/bin/sh\nPKG_CONFIG_PATH="" PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:+$PKG_CONFIG_LIBDIR:}/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" pkg-config "$@"\n' \
-    > /usr/local/bin/aarch64-linux-gnu-pkg-config && \
-    chmod +x /usr/local/bin/aarch64-linux-gnu-pkg-config
 
 RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ -C /opt && \

@@ -3,7 +3,32 @@
     .version = "0.0.0",
     .fingerprint = 0xb2d033cdfaf0d86a,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .SDL = .{
+            .url = "git+https://github.com/beebono/SDL.git#cc1c550cf19c705e8d497f49c6f853619475de9f",
+            .hash = "SDL-2.32.10-JToi3_xiGAHYaruhc-1H_eNlDfvPo-o6qPq40BcRM2aU",
+        },
+        .mbedtls = .{
+            .url = "git+https://github.com/allyourcodebase/mbedtls.git#3aa71a19acc173ae57b6a1114d62f2fdfd22960c",
+            .hash = "mbedtls-3.6.4-E4NUR2wWAAAUSvVbho9aaU31-e4D8glu9l1VfxKezBkV",
+        },
+        .protobuf_c = .{
+            .url = "git+https://github.com/beebono/protobuf-c.git#d6b225397c0b874f34dd6eacdbc637ca2340eb6c",
+            .hash = "protobuf_c-1.5.2-CLNmUeQUAABCQg80CdtqVC-eRB_PFKcKredIeH30lBMR",
+        },
+        .ihslib = .{
+            .url = "git+https://github.com/beebono/ihslib.git#b7476cfda715c7f12286d7652a9301bb15884488",
+            .hash = "N-V-__8AAJWwFQC-JRvpUUsPdfxP_qsWBE-8lfE6oGAqIT8U",
+        },
+        .ffmpeg = .{
+            .url = "git+https://github.com/beebono/ffmpeg-locomo.git#f41abd840721ac1276de0c9c20d893ca4d06d893",
+            .hash = "ffmpeg-7.0.1-10-zT7QA3foCATloqfJz44JESOyk4wPO5Dg-NsWVg8pOvYI",
+        },
+        .SDL_ttf = .{
+            .url = "git+https://github.com/beebono/SDL2_ttf.git#42ce972b8cf4942af70f3ad6e3617ddecd0e4076",
+            .hash = "SDL_ttf-3.2.3-1-PNW5xLgMAABtFRCeSFjMauAQfEnGasQEzz0p4jOFfjSN",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

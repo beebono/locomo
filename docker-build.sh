@@ -3,11 +3,11 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="locomo-builder"
 TARGET="${TARGET:-aarch64-linux-gnu.2.28}"
 
-docker build -t "$IMAGE" "$REPO_ROOT/docker"
+docker build -t "$IMAGE" "$REPO_ROOT"
 
 docker run --rm \
     -v "$REPO_ROOT:/work" \
@@ -15,4 +15,4 @@ docker run --rm \
     -e "ZIG_GLOBAL_CACHE_DIR=/work/.zig-cache" \
     -u "$(id -u):$(id -g)" \
     "$IMAGE" \
-    bash -c "scripts/bootstrap.sh && zig build -Dtarget=$TARGET -Doptimize=ReleaseFast"
+    bash -c "zig build -Dtarget=$TARGET -Doptimize=ReleaseFast"
