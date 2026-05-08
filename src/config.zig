@@ -173,12 +173,13 @@ fn fromDeviceJson(j: DeviceJson) DeviceConfig {
 pub fn loadPaired(allocator: std.mem.Allocator) !?PairedHost {
     const dir_path = try configDir(allocator);
     defer allocator.free(dir_path);
-    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "paired.json" });
-    defer allocator.free(file_path);
 
-    const file = Io.Dir.openFileAbsolute(io, file_path, .{}) catch return null;
+    const conf_dir = Io.Dir.createDirPathOpen(std.Io.Dir.cwd(), io, dir_path, .{}) catch return null;
+    defer Io.Dir.close(conf_dir, io);
+
+    const file = Io.Dir.openFile(conf_dir, io, "paired.json", .{}) catch return null;
     defer file.close(io);
-    const data = try readFileToEnd(allocator, file);
+    const data = readFileToEnd(allocator, file) catch return null;
     defer allocator.free(data);
     const parsed = std.json.parseFromSlice(PairedJson, allocator, data, .{}) catch return null;
     defer parsed.deinit();
@@ -188,9 +189,9 @@ pub fn loadPaired(allocator: std.mem.Allocator) !?PairedHost {
 pub fn savePaired(allocator: std.mem.Allocator, host: PairedHost) !void {
     const dir_path = try configDir(allocator);
     defer allocator.free(dir_path);
-    try Io.Dir.cwd().createDirPath(io, dir_path);
-    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "paired.json" });
-    defer allocator.free(file_path);
+
+    const conf_dir = try Io.Dir.createDirPathOpen(std.Io.Dir.cwd(), io, dir_path, .{});
+    defer Io.Dir.close(conf_dir, io);
 
     const name_len = std.mem.indexOfScalar(u8, &host.hostname, 0) orelse 64;
     const j = PairedJson{
@@ -207,7 +208,7 @@ pub fn savePaired(allocator: std.mem.Allocator, host: PairedHost) !void {
     var result = buf_writer.toArrayList();
     defer result.deinit(allocator);
 
-    const file = try Io.Dir.createFileAbsolute(io, file_path, .{});
+    const file = try Io.Dir.createFile(conf_dir, io, "paired.json", .{});
     defer file.close(io);
     try file.writeStreamingAll(io, result.items);
 }
@@ -226,10 +227,11 @@ fn fromPairedJson(j: PairedJson) PairedHost {
 pub fn loadSettings(allocator: std.mem.Allocator) !Settings {
     const dir_path = try configDir(allocator);
     defer allocator.free(dir_path);
-    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "settings.json" });
-    defer allocator.free(file_path);
 
-    const file = Io.Dir.openFileAbsolute(io, file_path, .{}) catch return Settings{};
+    const conf_dir = Io.Dir.createDirPathOpen(std.Io.Dir.cwd(), io, dir_path, .{}) catch return Settings{};
+    defer Io.Dir.close(conf_dir, io);
+
+    const file = Io.Dir.openFile(conf_dir, io, "settings.json", .{}) catch return Settings{};
     defer file.close(io);
     const data = readFileToEnd(allocator, file) catch return Settings{};
     defer allocator.free(data);
@@ -245,9 +247,9 @@ pub fn loadSettings(allocator: std.mem.Allocator) !Settings {
 pub fn saveSettings(allocator: std.mem.Allocator, s: Settings) !void {
     const dir_path = try configDir(allocator);
     defer allocator.free(dir_path);
-    try Io.Dir.cwd().createDirPath(io, dir_path);
-    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "settings.json" });
-    defer allocator.free(file_path);
+
+    const conf_dir = try Io.Dir.createDirPathOpen(std.Io.Dir.cwd(), io, dir_path, .{});
+    defer Io.Dir.close(conf_dir, io);
 
     var buf = std.ArrayList(u8).empty;
     var buf_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
@@ -255,7 +257,7 @@ pub fn saveSettings(allocator: std.mem.Allocator, s: Settings) !void {
     var sj: std.json.Stringify = .{ .writer = &buf_writer.writer, .options = .{} };
     try sj.write(s);
 
-    const file = try Io.Dir.createFileAbsolute(io, file_path, .{});
+    const file = try Io.Dir.createFile(conf_dir, io, "settings.json", .{});
     defer file.close(io);
     var result = buf_writer.toArrayList();
     defer result.deinit(allocator);
