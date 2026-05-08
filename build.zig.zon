@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .SDL = .{
-            .url = "git+https://github.com/beebono/SDL.git#cc1c550cf19c705e8d497f49c6f853619475de9f",
-            .hash = "SDL-2.32.10-JToi3_xiGAHYaruhc-1H_eNlDfvPo-o6qPq40BcRM2aU",
+            .url = "git+https://github.com/beebono/SDL.git#0809748c4e99d6279e3fdccf7fbc491cf265ed47",
+            .hash = "SDL-2.32.10-JToi3yxjGAHXcwT4uVceO5rQUD1P76_zKT1_wdMysPHS",
         },
         .mbedtls = .{
             .url = "git+https://github.com/allyourcodebase/mbedtls.git#3aa71a19acc173ae57b6a1114d62f2fdfd22960c",
@@ -25,8 +25,8 @@
             .hash = "ffmpeg-7.0.1-10-zT7QA3foCATloqfJz44JESOyk4wPO5Dg-NsWVg8pOvYI",
         },
         .SDL_ttf = .{
-            .url = "git+https://github.com/beebono/SDL2_ttf.git#42ce972b8cf4942af70f3ad6e3617ddecd0e4076",
-            .hash = "SDL_ttf-3.2.3-1-PNW5xLgMAABtFRCeSFjMauAQfEnGasQEzz0p4jOFfjSN",
+            .url = "git+https://github.com/beebono/SDL2_ttf.git#65997713f2d2414b9a2d9de5cddd0ce4c8b17a79",
+            .hash = "SDL_ttf-3.2.3-1-PNW5xLwMAAAim_hT4PFFOaR9BE-_iMnM_15pk7sAEp2T",
         },
     },
     .paths = .{

@@ -105,7 +105,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const sdl_lib = sdl_dep.artifact("SDL2");
+    const sdl_lib = sdl_dep.artifact("SDL2-2.0");
+    sdl_lib.root_module.strip = true;
     mod.linkLibrary(sdl_lib);
 
     // SDL2_ttf
@@ -168,6 +169,8 @@ pub fn build(b: *std.Build) void {
     }
 
     const install_step = b.addInstallArtifact(exe, .{});
+    const install_sdl_lib = b.addInstallFile(sdl_lib.getEmittedBin(), "lib/libSDL2.so.2");
+    b.getInstallStep().dependOn(&install_sdl_lib.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

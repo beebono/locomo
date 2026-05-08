@@ -23,8 +23,8 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 - ARM64 Linux (aarch64)
 - VPU hardware for video decoding (software decoding also available)
 - EGL and OpenGL ES 2.0 for zero-copy DRM frame rendering
+- `libSDL2` available on the system
 - A Steam host on the same local network with Remote Play enabled
-- **NOTE** The TrimUI Smart Pro (Non-S) is known to NOT work with locomo. Please consider upgrading if you would like to use locomo on a similar (and honestly better) device.
 
 ### Build (Docker path - recommended)
 
