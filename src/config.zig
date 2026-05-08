@@ -107,28 +107,26 @@ pub fn loadOrCreate(allocator: std.mem.Allocator) !DeviceConfig {
     const dir_path = try configDir(allocator);
     defer allocator.free(dir_path);
 
-    try Io.Dir.cwd().createDirPath(io, dir_path);
+    const conf_dir = try Io.Dir.createDirPathOpen(std.Io.Dir.cwd(), io, dir_path, .{});
+    defer Io.Dir.close(conf_dir, io);
 
-    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "device.json" });
-    defer allocator.free(file_path);
-
-    if (Io.Dir.openFileAbsolute(io, file_path, .{})) |file| {
+    if (Io.Dir.openFile(conf_dir, io, "device.json", .{})) |file| {
         defer file.close(io);
         const data = readFileToEnd(allocator, file) catch {
-            return generateAndSave(allocator, file_path);
+            return generateAndSave(allocator, conf_dir);
         };
         defer allocator.free(data);
         const parsed = std.json.parseFromSlice(DeviceJson, allocator, data, .{}) catch {
-            return generateAndSave(allocator, file_path);
+            return generateAndSave(allocator, conf_dir);
         };
         defer parsed.deinit();
         return fromDeviceJson(parsed.value);
     } else |_| {
-        return generateAndSave(allocator, file_path);
+        return generateAndSave(allocator, conf_dir);
     }
 }
 
-fn generateAndSave(allocator: std.mem.Allocator, file_path: []const u8) !DeviceConfig {
+fn generateAndSave(allocator: std.mem.Allocator, dir_path: Io.Dir) !DeviceConfig {
     var cfg: DeviceConfig = undefined;
     const rng_impl: std.Random.IoSource = .{ .io = io };
     const rng = rng_impl.interface();
@@ -138,11 +136,11 @@ fn generateAndSave(allocator: std.mem.Allocator, file_path: []const u8) !DeviceC
     const name = "Locomo";
     @memcpy(cfg.device_name[0..name.len], name);
 
-    try saveDeviceConfig(allocator, file_path, cfg);
+    try saveDeviceConfig(allocator, dir_path, cfg);
     return cfg;
 }
 
-fn saveDeviceConfig(allocator: std.mem.Allocator, file_path: []const u8, cfg: DeviceConfig) !void {
+fn saveDeviceConfig(allocator: std.mem.Allocator, dir_path: Io.Dir, cfg: DeviceConfig) !void {
     const name_len = std.mem.indexOfScalar(u8, &cfg.device_name, 0) orelse 64;
     const j = DeviceJson{
         .device_id = cfg.device_id,
@@ -157,7 +155,7 @@ fn saveDeviceConfig(allocator: std.mem.Allocator, file_path: []const u8, cfg: De
     var result = buf_writer.toArrayList();
     defer result.deinit(allocator);
 
-    const file = try Io.Dir.createFileAbsolute(io, file_path, .{});
+    const file = try Io.Dir.createFile(dir_path, io, "device.json", .{});
     defer file.close(io);
     try file.writeStreamingAll(io, result.items);
 }

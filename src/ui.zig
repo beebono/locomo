@@ -15,11 +15,18 @@ const COLOR_ERR = c.SDL_Color{ .r = 220, .g = 60, .b = 60, .a = 255 };
 
 pub const PinStatus = enum { idle, waiting, denied, failed };
 
+// Layout reference: design at 1920x1080, use unit scaling based on this
+const DESIGN_H: f32 = 1080.0;
+const DESIGN_SAFE_W: f32 = 1920.0;
+
 pub const Ui = struct {
     window: *c.SDL_Window,
     renderer: *c.SDL_Renderer,
     logical_w: c_int = 1280,
     logical_h: c_int = 720,
+    unit: f32 = 1.0,
+    safe_w: c_int = 1280,
+    safe_x: c_int = 0,
     font: *c.TTF_Font,
     font_small: *c.TTF_Font,
     gl_ctx: ?gl.GlCtx = null,
@@ -68,11 +75,17 @@ pub const Ui = struct {
             if (c.SDL_IsGameController(ci) != 0) _ = c.SDL_GameControllerOpen(ci);
         }
 
-        const size_big = @as(c_int, @intFromFloat(@round(FONT_BIG * @as(f32, @floatFromInt(screen_h)) / 1080.0)));
+        const min_dim: f32 = @floatFromInt(@min(screen_w, screen_h));
+        const unit: f32 = min_dim / DESIGN_H;
+        const safe_w_f = @min(@as(f32, @floatFromInt(screen_w)), unit * DESIGN_SAFE_W);
+        const safe_w: c_int = @intFromFloat(@round(safe_w_f));
+        const safe_x: c_int = @divTrunc(screen_w - safe_w, 2);
+
+        const size_big = @as(c_int, @intFromFloat(@round(FONT_BIG * unit)));
         const font = c.TTF_OpenFontRW(c.SDL_RWFromConstMem(FONT_OTF.ptr, FONT_OTF.len), 1, size_big) orelse return error.OpenFontFailed;
         errdefer c.TTF_CloseFont(font);
 
-        const size_small = @as(c_int, @intFromFloat(@round(FONT_SMALL * @as(f32, @floatFromInt(screen_h)) / 1080.0)));
+        const size_small = @as(c_int, @intFromFloat(@round(FONT_SMALL * unit)));
         const font_small = c.TTF_OpenFontRW(c.SDL_RWFromConstMem(FONT_OTF.ptr, FONT_OTF.len), 1, size_small) orelse return error.OpenFontFailed;
 
         return Ui{
@@ -80,10 +93,17 @@ pub const Ui = struct {
             .renderer = renderer,
             .logical_w = screen_w,
             .logical_h = screen_h,
+            .unit = unit,
+            .safe_w = safe_w,
+            .safe_x = safe_x,
             .font = font,
             .font_small = font_small,
             .gl_ctx = gl_ctx,
         };
+    }
+
+    inline fn u(self: *const Ui, n: f32) c_int {
+        return @intFromFloat(@round(self.unit * n));
     }
 
     pub fn recreateRenderer(self: *Ui) !void {
@@ -151,12 +171,12 @@ pub const Ui = struct {
         var tw: c_int = 0;
         var th: c_int = 0;
         _ = c.TTF_SizeUTF8(self.font_small, text.ptr, &tw, &th);
-        const pad_x: c_int = 24;
-        const pad_y: c_int = 12;
+        const pad_x: c_int = self.u(24);
+        const pad_y: c_int = self.u(12);
         const box_w = tw + pad_x * 2;
         const box_h = th + pad_y * 2;
         const x = @divTrunc(self.logical_w - box_w, 2);
-        const y = @divTrunc(self.logical_h, 24);
+        const y = self.u(45);
         self.drawRect(x, y, box_w, box_h, c.SDL_Color{ .r = 15, .g = 15, .b = 30, .a = 255 });
         self.drawRectOutline(x, y, box_w, box_h, COLOR_DIM);
         self.renderText(text, x + pad_x, y + pad_y, COLOR_FG, self.font_small);
@@ -176,22 +196,25 @@ pub const Ui = struct {
         scanning: bool,
     ) void {
         self.clear();
-        self.renderTextCentered("LOCOMO", @divTrunc(self.logical_h, 16), COLOR_FG, self.font);
+        self.renderTextCentered("LOCOMO", self.u(60), COLOR_FG, self.font);
 
         if (scanning) {
-            self.renderTextCentered("Scanning for Steam hosts...", @divTrunc(self.logical_h, 8), COLOR_DIM, self.font_small);
+            self.renderTextCentered("Scanning for Steam hosts...", self.u(135), COLOR_DIM, self.font_small);
         } else if (hosts.len == 0) {
-            self.renderTextCentered("No hosts found.  Press A to scan again.", @divTrunc(self.logical_h, 8), COLOR_DIM, self.font_small);
+            self.renderTextCentered("No hosts found.  Press A to scan again.", self.u(135), COLOR_DIM, self.font_small);
         }
 
-        const list_y: i32 = @divTrunc(self.logical_h, 5);
-        const row_h: i32 = @divTrunc(self.logical_h, 12);
+        const list_y: i32 = self.u(216);
+        const row_h: i32 = self.u(90);
+        const row_indent: i32 = self.safe_x + self.u(80);
+        const row_bg_x: i32 = self.safe_x + self.u(40);
+        const row_bg_w: i32 = self.safe_w - self.u(80);
         for (hosts, 0..) |host, i| {
             const y = list_y + @as(i32, @intCast(i)) * row_h;
             const is_sel = (i == self.host_cursor);
 
             if (is_sel) {
-                self.drawRect(@divTrunc(self.logical_w, 12), y - 6, self.logical_w - @divTrunc(self.logical_w, 6), row_h - 4, .{ .r = 30, .g = 50, .b = 100, .a = 255 });
+                self.drawRect(row_bg_x, y - self.u(6), row_bg_w, row_h - self.u(4), .{ .r = 30, .g = 50, .b = 100, .a = 255 });
             }
 
             var name_buf: [80]u8 = undefined;
@@ -199,10 +222,10 @@ pub const Ui = struct {
             const name = host.hostname[0..name_len];
             const label = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch continue;
             const col = if (is_sel) COLOR_SEL else COLOR_FG;
-            self.renderText(label, @divTrunc(self.logical_w, 9), y, col, self.font);
+            self.renderText(label, row_indent, y, col, self.font);
         }
 
-        self.renderTextCentered("DPAD to navigate  A to connect  START for settings", self.logical_h - @divTrunc(self.logical_h, 12), COLOR_DIM, self.font_small);
+        self.renderTextCentered("DPAD to navigate  A to connect  START for settings", self.logical_h - self.u(90), COLOR_DIM, self.font_small);
         self.present();
     }
 
@@ -222,7 +245,7 @@ pub const Ui = struct {
 
     pub fn drawStatus(self: *Ui, msg: [:0]const u8) void {
         self.clear();
-        self.renderTextCentered(msg, @divTrunc(self.logical_h, 2) - 16, COLOR_FG, self.font);
+        self.renderTextCentered(msg, @divTrunc(self.logical_h, 2) - self.u(16), COLOR_FG, self.font);
         self.present();
     }
 
@@ -234,15 +257,15 @@ pub const Ui = struct {
 
     pub fn drawPinDisplay(self: *Ui, pin: *const [4]u8) void {
         self.clear();
-        self.renderTextCentered("Pairing...", @divTrunc(self.logical_h, 12), COLOR_FG, self.font);
-        self.renderTextCentered("Type the PIN shown below into Steam on your PC.", @divTrunc(self.logical_h, 6), COLOR_DIM, self.font_small);
+        self.renderTextCentered("Pairing...", self.u(90), COLOR_FG, self.font);
+        self.renderTextCentered("Type the PIN shown below into Steam on your PC.", self.u(180), COLOR_DIM, self.font_small);
 
-        const slot_w: i32 = 90;
-        const slot_h: i32 = 110;
-        const gap: i32 = 20;
+        const slot_w: i32 = self.u(90);
+        const slot_h: i32 = self.u(110);
+        const gap: i32 = self.u(20);
         const total_w = 4 * slot_w + 3 * gap;
         const start_x = @divTrunc(self.logical_w - total_w, 2);
-        const slot_y: i32 = @divTrunc(self.logical_h, 3);
+        const slot_y: i32 = self.u(360);
 
         for (pin, 0..) |digit, i| {
             const x = start_x + @as(i32, @intCast(i)) * (slot_w + gap);
@@ -262,7 +285,7 @@ pub const Ui = struct {
             _ = c.SDL_RenderCopy(self.renderer, tex, null, &c.SDL_Rect{ .x = cx, .y = cy, .w = tw, .h = th });
         }
 
-        const status_y: i32 = @divTrunc(self.logical_h, 3) + @divTrunc(self.logical_h, 6);
+        const status_y: i32 = self.u(540);
         switch (self.pin_status) {
             .idle, .waiting => self.renderTextCentered("Waiting for PC confirmation...  B = cancel", status_y, COLOR_DIM, self.font_small),
             .denied => self.renderTextCentered("PIN denied.", status_y, COLOR_ERR, self.font_small),
@@ -275,18 +298,20 @@ pub const Ui = struct {
 
     pub fn drawSettingsScreen(self: *Ui, s: config.Settings) void {
         self.clear();
-        self.renderTextCentered("Settings", @divTrunc(self.logical_h, 12), COLOR_FG, self.font);
+        self.renderTextCentered("Settings", self.u(90), COLOR_FG, self.font);
 
         const rows = [_][:0]const u8{ "Quality Preset", "Resolution", "Bandwidth Limit", "Framerate Limit", "Audio Type", "H.265 / HEVC (WIP)", "HW Decode", "Button Swap" };
-        const start_y: i32 = @divTrunc(self.logical_h, 9) * 2;
-        const row_h: i32 = @divTrunc(self.logical_h, 12);
+        const start_y: i32 = self.u(240);
+        const row_h: i32 = self.u(90);
+        const label_x: i32 = self.safe_x + self.u(120);
+        const value_x: i32 = self.safe_x + self.safe_w - self.u(560);
 
         for (rows, 0..) |row_name, i| {
             const y = start_y + @as(i32, @intCast(i)) * row_h;
             const is_sel = (i == self.settings_row);
             const label_col = if (is_sel) COLOR_SEL else COLOR_FG;
 
-            self.renderText(row_name, @divTrunc(self.logical_w, 6), y, label_col, self.font);
+            self.renderText(row_name, label_x, y, label_col, self.font);
 
             var vbuf: [32]u8 = undefined;
             const val: [:0]const u8 = switch (i) {
@@ -327,10 +352,10 @@ pub const Ui = struct {
                 else => std.fmt.bufPrintZ(&vbuf, "", .{}) catch "",
             };
 
-            self.renderText(val, self.logical_w - @divTrunc(self.logical_w, 3), y, label_col, self.font);
+            self.renderText(val, value_x, y, label_col, self.font);
         }
 
-        self.renderTextCentered("DPAD Up/Down = select  Left/Right/A = value  B = save", self.logical_h - @divTrunc(self.logical_h, 12), COLOR_DIM, self.font_small);
+        self.renderTextCentered("DPAD Up/Down = select  Left/Right/A = value  B = save", self.logical_h - self.u(90), COLOR_DIM, self.font_small);
         self.present();
     }
 
