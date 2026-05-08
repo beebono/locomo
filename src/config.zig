@@ -114,7 +114,9 @@ pub fn loadOrCreate(allocator: std.mem.Allocator) !DeviceConfig {
 
     if (Io.Dir.openFileAbsolute(io, file_path, .{})) |file| {
         defer file.close(io);
-        const data = try readFileToEnd(allocator, file);
+        const data = readFileToEnd(allocator, file) catch {
+            return generateAndSave(allocator, file_path);
+        };
         defer allocator.free(data);
         const parsed = std.json.parseFromSlice(DeviceJson, allocator, data, .{}) catch {
             return generateAndSave(allocator, file_path);

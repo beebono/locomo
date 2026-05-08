@@ -13,11 +13,6 @@ const RING_SLOTS: usize = 32;
 // HACK: Stupid dumb stupid thing to not break due to needed ffmpeg downgrade...
 const V4L2HWTYPE: c.AVHWDeviceType = c.AV_HWDEVICE_TYPE_DRM;
 
-fn deviceExists(path: []const u8) bool {
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
-}
-
 const PacketSlot = struct {
     data: [SLOT_CAP]u8 = undefined,
     len: usize = 0,
@@ -367,16 +362,12 @@ fn selectCodec(codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extra
     const hw_candidates: []const Candidate = if (is_hevc) &.{
         .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
         .{ .name = "hevc", .hw_type = V4L2HWTYPE },
+        .{ .name = "hevc_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
     } else &.{
         .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
         .{ .name = "h264", .hw_type = V4L2HWTYPE },
+        .{ .name = "h264_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
     };
-    if (deviceExists("/dev/mpp_service")) {
-        const mpp_cand = if (is_hevc) Candidate{ .name = "hevc_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE } else Candidate{ .name = "h264_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE };
-        if (openCandidate(w, h, extradata, mpp_cand.name, mpp_cand.hw_type)) |cc| {
-            return cc;
-        }
-    }
     if (hw_decode) {
         for (hw_candidates) |cand| {
             if (openCandidate(w, h, extradata, cand.name, cand.hw_type)) |cc| {
