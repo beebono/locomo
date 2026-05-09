@@ -21,8 +21,8 @@
             .hash = "N-V-__8AAJWwFQC-JRvpUUsPdfxP_qsWBE-8lfE6oGAqIT8U",
         },
         .ffmpeg = .{
-            .url = "git+https://github.com/beebono/ffmpeg-locomo.git#f41abd840721ac1276de0c9c20d893ca4d06d893",
-            .hash = "ffmpeg-7.0.1-10-zT7QA3foCATloqfJz44JESOyk4wPO5Dg-NsWVg8pOvYI",
+            .url = "git+https://github.com/beebono/ffmpeg-locomo.git#d26a8ad0850753eabee95a953588f0f05d6ab858",
+            .hash = "ffmpeg-7.0.1-10-zT7QA4LACQRLrKcqnX-2_YHSDdup5OwigNhpuzACPF4r",
         },
         .SDL_ttf = .{
             .url = "git+https://github.com/beebono/SDL2_ttf.git#65997713f2d2414b9a2d9de5cddd0ce4c8b17a79",

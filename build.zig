@@ -119,11 +119,15 @@ pub fn build(b: *std.Build) void {
 
     // ihslib
     const ihslib_upstream = b.dependency("ihslib", .{});
-    const ihslib = b.addLibrary(.{ .name = "ihslib", .linkage = .static, .root_module = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }) });
+    const ihslib = b.addLibrary(.{
+        .name = "ihslib",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
     ihslib.root_module.addIncludePath(ihslib_upstream.path("src"));
     ihslib.root_module.addIncludePath(ihslib_upstream.path("src/hid/sdl/include"));
     ihslib.root_module.addIncludePath(ihslib_upstream.path("include"));
@@ -145,7 +149,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mod.linkLibrary(ffmpeg_dep.artifact("ffmpeg"));
+    const ffmpeg_lib = ffmpeg_dep.artifact("ffmpeg");
+    const mpp_lib = ffmpeg_dep.artifact("rockchip_mpp");
+    mod.linkLibrary(ffmpeg_lib);
+    mod.linkLibrary(mpp_lib);
 
     // System libraries
     mod.linkSystemLibrary("EGL", .{});
@@ -170,7 +177,9 @@ pub fn build(b: *std.Build) void {
 
     const install_step = b.addInstallArtifact(exe, .{});
     const install_sdl_lib = b.addInstallFile(sdl_lib.getEmittedBin(), "lib/libSDL2.so.2");
+    const install_mpp_lib = b.addInstallFile(mpp_lib.getEmittedBin(), "lib/librockchip_mpp.so.1");
     b.getInstallStep().dependOn(&install_sdl_lib.step);
+    b.getInstallStep().dependOn(&install_mpp_lib.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

@@ -179,6 +179,8 @@ pub const DecodeCtx = struct {
     pending_h: std.atomic.Value(i32),
     force_disconnect: std.atomic.Value(bool),
     submit_stuck_since_ms: i64,
+    consecutive_bad_frames: u32,
+    manual_resize: bool,
 
     // Audio
     audio_codec_ctx: ?*c.AVCodecContext,
@@ -223,6 +225,8 @@ pub const DecodeCtx = struct {
             .audio_swr_ctx = null,
             .audio_device = 0,
             .audio_max_queue_bytes = 0,
+            .consecutive_bad_frames = 0,
+            .manual_resize = false,
         };
     }
 
@@ -353,24 +357,26 @@ fn openSoftware(w: c_int, h: c_int, extradata: ?[]const u8, codec_id: c.AVCodecI
     return cc;
 }
 
-fn selectCodec(codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extradata: ?[]const u8) ?*c.AVCodecContext {
+fn selectCodec(ctx: *DecodeCtx, codec_id: c.AVCodecID, hw_decode: bool, w: c_int, h: c_int, extradata: ?[]const u8) ?*c.AVCodecContext {
     const Candidate = struct {
         name: [*:0]const u8,
         hw_type: c.AVHWDeviceType,
+        manual_resize: bool,
     };
     const is_hevc = codec_id == c.AV_CODEC_ID_HEVC;
     const hw_candidates: []const Candidate = if (is_hevc) &.{
-        .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
-        .{ .name = "hevc", .hw_type = V4L2HWTYPE },
-        .{ .name = "hevc_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+        .{ .name = "hevc_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_RKMPP, .manual_resize = false },
+        .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM, .manual_resize = true },
+        .{ .name = "hevc", .hw_type = V4L2HWTYPE, .manual_resize = true },
     } else &.{
-        .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM },
-        .{ .name = "h264", .hw_type = V4L2HWTYPE },
-        .{ .name = "h264_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_NONE },
+        .{ .name = "h264_rkmpp", .hw_type = c.AV_HWDEVICE_TYPE_RKMPP, .manual_resize = false },
+        .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM, .manual_resize = true },
+        .{ .name = "h264", .hw_type = V4L2HWTYPE, .manual_resize = true },
     };
     if (hw_decode) {
         for (hw_candidates) |cand| {
             if (openCandidate(w, h, extradata, cand.name, cand.hw_type)) |cc| {
+                ctx.manual_resize = cand.manual_resize;
                 return cc;
             }
         }
@@ -400,7 +406,7 @@ fn videoStart(
         null;
     const width = alignUp16(@intCast(cfg.width));
     const height = alignUp16(@intCast(cfg.height));
-    const codec_ctx = selectCodec(codec_id, ctx.hw_decode, width, height, extradata) orelse return -1;
+    const codec_ctx = selectCodec(ctx, codec_id, ctx.hw_decode, width, height, extradata) orelse return -1;
 
     ctx.video_codec_ctx = codec_ctx;
     ctx.canvas_w = width;
@@ -492,6 +498,13 @@ fn populateFrame(ctx: *DecodeCtx) bool {
     const av_frame = ctx.av_frame orelse return false;
     const sw_frame = ctx.av_sw_frame orelse return false;
     defer c.av_frame_unref(av_frame);
+
+    if (ctx.hw_decode and av_frame.format != c.AV_PIX_FMT_DRM_PRIME) {
+        std.log.warn("[locomo] HW decode was set, but received a non-DRM frame. Falling back to SW decode.\n", .{});
+        ctx.hw_decode = false;
+        rebuildCodec(ctx, ctx.canvas_w, ctx.canvas_h);
+        return false;
+    }
 
     if (av_frame.format == c.AV_PIX_FMT_DRM_PRIME) {
         const cloned = c.av_frame_clone(av_frame) orelse return false;
@@ -599,6 +612,27 @@ fn populateFrame(ctx: *DecodeCtx) bool {
     return true;
 }
 
+fn drainFrames(ctx: *DecodeCtx, codec_ctx: ?*c.AVCodecContext) bool {
+    while (!ctx.force_disconnect.load(.acquire)) {
+        const r = c.avcodec_receive_frame(codec_ctx, ctx.av_frame);
+        if (r == 0) {
+            if (populateFrame(ctx)) {
+                ctx.consecutive_bad_frames = 0;
+            } else {
+                ctx.consecutive_bad_frames += 1;
+                if (ctx.consecutive_bad_frames >= 30) {
+                    ctx.force_disconnect.store(true, .release);
+                }
+            }
+            continue;
+        }
+        if (r == c.AVERROR(c.EAGAIN) or r == c.AVERROR_EOF) break;
+        // Actual error receiving frame
+        return false;
+    }
+    return true;
+}
+
 fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
     if (ctx.video_codec_ctx) |old| {
         _ = c.avcodec_send_packet(old, null);
@@ -609,10 +643,11 @@ fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
     ctx.video_codec_ctx = null;
     const aligned_w = alignUp16(@intCast(w));
     const aligned_h = alignUp16(@intCast(h));
-    const cc = selectCodec(ctx.codec_id, ctx.hw_decode, aligned_w, aligned_h, null) orelse return;
+    const cc = selectCodec(ctx, ctx.codec_id, ctx.hw_decode, aligned_w, aligned_h, null) orelse return;
     ctx.video_codec_ctx = cc;
     ctx.req_w = aligned_w;
     ctx.req_h = aligned_h;
+    ctx.consecutive_bad_frames = 0;
 }
 
 fn videoDecodeThread(ctx: *DecodeCtx) void {
@@ -623,8 +658,6 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
     defer ctx.allocator.free(scratch);
 
     var waiting_for_keyframe = true;
-    var consecutive_bad_frames: u32 = 0;
-    const bad_frame_limit: u32 = 60;
 
     while (!ctx.force_disconnect.load(.acquire)) {
         var is_keyframe: bool = false;
@@ -659,17 +692,15 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
             if (ctx.pending_resize.load(.acquire)) {
                 const new_w = ctx.pending_w.load(.acquire);
                 const new_h = ctx.pending_h.load(.acquire);
-                if (new_w != ctx.req_w or new_h != ctx.req_h) {
+                const dims_changed = new_w != ctx.req_w or new_h != ctx.req_h;
+                if (dims_changed and ctx.manual_resize) {
                     rebuildCodec(ctx, new_w, new_h);
                     ctx.need_keyframe.store(true, .release);
                     continue;
-                } else if (ctx.video_codec_ctx) |cc| {
-                    c.avcodec_flush_buffers(cc);
                 }
-                ctx.pending_resize.store(false, .release);
-            } else if (ctx.video_codec_ctx) |cc| {
-                c.avcodec_flush_buffers(cc);
             }
+            if (ctx.video_codec_ctx) |cc| c.avcodec_flush_buffers(cc);
+            ctx.pending_resize.store(false, .release);
             waiting_for_keyframe = false;
         }
 
@@ -681,36 +712,33 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
         @memcpy(pkt.*.data[0..n], scratch[0..n]);
         if (is_keyframe) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
 
-        if (c.avcodec_send_packet(codec_ctx, pkt) != 0) {
-            const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
-            const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
-            rebuildCodec(ctx, fb_w, fb_h);
+        var send_retries: u32 = 0;
+        send: while (!ctx.force_disconnect.load(.acquire)) {
+            const sret = c.avcodec_send_packet(codec_ctx, pkt);
+            if (sret == 0) break :send;
+            if (sret == c.AVERROR(c.EAGAIN)) {
+                if (drainFrames(ctx, codec_ctx)) {
+                    send_retries += 1;
+                    if (send_retries < 4) continue :send;
+                    // Secondary failsafe, shouldn't need a full codec rebuild here
+                    waiting_for_keyframe = true;
+                    ctx.need_keyframe.store(true, .release);
+                    continue;
+                }
+            }
+            if (ctx.manual_resize) {
+                const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
+                const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
+                rebuildCodec(ctx, fb_w, fb_h);
+            } else {
+                if (ctx.video_codec_ctx) |cc| c.avcodec_flush_buffers(cc);
+            }
             waiting_for_keyframe = true;
             ctx.need_keyframe.store(true, .release);
             continue;
         }
 
-        while (!ctx.force_disconnect.load(.acquire)) {
-            const r = c.avcodec_receive_frame(codec_ctx, ctx.av_frame);
-            if (r == 0) {
-                if (populateFrame(ctx)) {
-                    consecutive_bad_frames = 0;
-                } else {
-                    consecutive_bad_frames += 1;
-                    if (consecutive_bad_frames >= bad_frame_limit) {
-                        ctx.force_disconnect.store(true, .release);
-                    }
-                }
-                break;
-            }
-            if (r == c.AVERROR(c.EAGAIN) or r == c.AVERROR_EOF) break;
-            const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
-            const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
-            rebuildCodec(ctx, fb_w, fb_h);
-            waiting_for_keyframe = true;
-            ctx.need_keyframe.store(true, .release);
-            break;
-        }
+        _ = drainFrames(ctx, codec_ctx);
     }
 }
 
