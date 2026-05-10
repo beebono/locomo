@@ -371,22 +371,22 @@ fn selectCodec(ctx: *DecodeCtx, codec_id: c.AVCodecID, hw_decode: bool, w: c_int
         .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM, .manual_resize = true },
         .{ .name = "h264", .hw_type = c.AV_HWDEVICE_TYPE_V4L2REQUEST, .manual_resize = true },
     };
-    if (deviceExists("/dev/mpp_service")) {
-        const mpp_cand = if (is_hevc) Candidate{
-            .name = "hevc_rkmpp",
-            .hw_type = c.AV_HWDEVICE_TYPE_RKMPP,
-            .manual_resize = false,
-        } else Candidate{
-            .name = "h264_rkmpp",
-            .hw_type = c.AV_HWDEVICE_TYPE_RKMPP,
-            .manual_resize = false,
-        };
-        if (openCandidate(w, h, extradata, mpp_cand.name, mpp_cand.hw_type)) |cc| {
-            ctx.manual_resize = mpp_cand.manual_resize;
-            return cc;
-        }
-    }
     if (hw_decode) {
+        if (deviceExists("/dev/mpp_service")) {
+            const mpp_cand = if (is_hevc) Candidate{
+                .name = "hevc_rkmpp",
+                .hw_type = c.AV_HWDEVICE_TYPE_RKMPP,
+                .manual_resize = false,
+            } else Candidate{
+                .name = "h264_rkmpp",
+                .hw_type = c.AV_HWDEVICE_TYPE_RKMPP,
+                .manual_resize = false,
+            };
+            if (openCandidate(w, h, extradata, mpp_cand.name, mpp_cand.hw_type)) |cc| {
+                ctx.manual_resize = mpp_cand.manual_resize;
+                return cc;
+            }
+        }
         for (hw_candidates) |cand| {
             if (openCandidate(w, h, extradata, cand.name, cand.hw_type)) |cc| {
                 ctx.manual_resize = cand.manual_resize;
