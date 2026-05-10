@@ -366,10 +366,10 @@ fn selectCodec(ctx: *DecodeCtx, codec_id: c.AVCodecID, hw_decode: bool, w: c_int
     const is_hevc = codec_id == c.AV_CODEC_ID_HEVC;
     const hw_candidates: []const Candidate = if (is_hevc) &.{
         .{ .name = "hevc_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM, .manual_resize = true },
-        .{ .name = "hevc", .hw_type = c.AV_HWDEVICE_TYPE_V4L2REQUEST, .manual_resize = true },
+        .{ .name = "hevc", .hw_type = c.AV_HWDEVICE_TYPE_V4L2REQUEST, .manual_resize = false },
     } else &.{
         .{ .name = "h264_v4l2m2m", .hw_type = c.AV_HWDEVICE_TYPE_DRM, .manual_resize = true },
-        .{ .name = "h264", .hw_type = c.AV_HWDEVICE_TYPE_V4L2REQUEST, .manual_resize = true },
+        .{ .name = "h264", .hw_type = c.AV_HWDEVICE_TYPE_V4L2REQUEST, .manual_resize = false },
     };
     if (hw_decode) {
         if (deviceExists("/dev/mpp_service")) {

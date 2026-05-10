@@ -446,27 +446,62 @@ pub const VideoRenderer = struct {
 
         var attrs: [30]c.EGLint = undefined;
         var n: usize = 0;
-        attrs[n] = c.EGL_WIDTH; n += 1; attrs[n] = @intCast(frame_w); n += 1;
-        attrs[n] = c.EGL_HEIGHT; n += 1; attrs[n] = @intCast(frame_h); n += 1;
-        attrs[n] = c.EGL_LINUX_DRM_FOURCC_EXT; n += 1; attrs[n] = @bitCast(DRM_FORMAT_NV12); n += 1;
+        attrs[n] = c.EGL_WIDTH;
+        n += 1;
+        attrs[n] = @intCast(frame_w);
+        n += 1;
+        attrs[n] = c.EGL_HEIGHT;
+        n += 1;
+        attrs[n] = @intCast(frame_h);
+        n += 1;
+        attrs[n] = c.EGL_LINUX_DRM_FOURCC_EXT;
+        n += 1;
+        attrs[n] = @bitCast(DRM_FORMAT_NV12);
+        n += 1;
 
-        attrs[n] = c.EGL_DMA_BUF_PLANE0_FD_EXT; n += 1; attrs[n] = oy.fd; n += 1;
-        attrs[n] = c.EGL_DMA_BUF_PLANE0_OFFSET_EXT; n += 1; attrs[n] = @intCast(py.offset); n += 1;
-        attrs[n] = c.EGL_DMA_BUF_PLANE0_PITCH_EXT; n += 1; attrs[n] = @intCast(py.pitch); n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE0_FD_EXT;
+        n += 1;
+        attrs[n] = oy.fd;
+        n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+        n += 1;
+        attrs[n] = @intCast(py.offset);
+        n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE0_PITCH_EXT;
+        n += 1;
+        attrs[n] = @intCast(py.pitch);
+        n += 1;
 
-        attrs[n] = c.EGL_DMA_BUF_PLANE1_FD_EXT; n += 1; attrs[n] = ouv.fd; n += 1;
-        attrs[n] = c.EGL_DMA_BUF_PLANE1_OFFSET_EXT; n += 1; attrs[n] = @intCast(puv.offset); n += 1;
-        attrs[n] = c.EGL_DMA_BUF_PLANE1_PITCH_EXT; n += 1; attrs[n] = @intCast(puv.pitch); n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE1_FD_EXT;
+        n += 1;
+        attrs[n] = ouv.fd;
+        n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE1_OFFSET_EXT;
+        n += 1;
+        attrs[n] = @intCast(puv.offset);
+        n += 1;
+        attrs[n] = c.EGL_DMA_BUF_PLANE1_PITCH_EXT;
+        n += 1;
+        attrs[n] = @intCast(puv.pitch);
+        n += 1;
 
         if (self.gl.has_modifiers and oy.format_modifier != DRM_FORMAT_MOD_INVALID) {
-            attrs[n] = c.EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT; n += 1;
-            attrs[n] = @bitCast(@as(u32, @truncate(oy.format_modifier))); n += 1;
-            attrs[n] = c.EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT; n += 1;
-            attrs[n] = @bitCast(@as(u32, @truncate(oy.format_modifier >> 32))); n += 1;
-            attrs[n] = c.EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT; n += 1;
-            attrs[n] = @bitCast(@as(u32, @truncate(ouv.format_modifier))); n += 1;
-            attrs[n] = c.EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT; n += 1;
-            attrs[n] = @bitCast(@as(u32, @truncate(ouv.format_modifier >> 32))); n += 1;
+            attrs[n] = c.EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+            n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(oy.format_modifier)));
+            n += 1;
+            attrs[n] = c.EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+            n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(oy.format_modifier >> 32)));
+            n += 1;
+            attrs[n] = c.EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT;
+            n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(ouv.format_modifier)));
+            n += 1;
+            attrs[n] = c.EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT;
+            n += 1;
+            attrs[n] = @bitCast(@as(u32, @truncate(ouv.format_modifier >> 32)));
+            n += 1;
         }
         attrs[n] = c.EGL_NONE;
 
