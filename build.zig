@@ -133,7 +133,7 @@ pub fn build(b: *std.Build) void {
     ihslib.root_module.addIncludePath(ihslib_upstream.path("include"));
     ihslib.root_module.linkLibrary(mbedtls_lib);
     ihslib.root_module.linkLibrary(protobufc_lib);
-    ihslib.root_module.linkLibrary(sdl_lib);
+    ihslib.root_module.addIncludePath(sdl_lib.getEmittedIncludeTree());
     ihslib.root_module.addIncludePath(protobufc_dep.path("."));
     ihslib.root_module.addCSourceFiles(.{
         .root = ihslib_upstream.path("src"),
@@ -176,7 +176,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const install_step = b.addInstallArtifact(exe, .{});
-    const install_sdl_lib = b.addInstallFile(sdl_lib.getEmittedBin(), "lib/libSDL2.so.2");
+    const install_sdl_lib = b.addInstallFile(sdl_lib.getEmittedBin(), "lib/libSDL2-2.0.so.0");
     const install_mpp_lib = b.addInstallFile(mpp_lib.getEmittedBin(), "lib/librockchip_mpp.so.1");
     b.getInstallStep().dependOn(&install_sdl_lib.step);
     b.getInstallStep().dependOn(&install_mpp_lib.step);

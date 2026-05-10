@@ -181,7 +181,6 @@ pub const DecodeCtx = struct {
     pending_h: std.atomic.Value(i32),
     force_disconnect: std.atomic.Value(bool),
     submit_stuck_since_ms: i64,
-    consecutive_bad_frames: u32,
     manual_resize: bool,
 
     // Audio
@@ -191,7 +190,7 @@ pub const DecodeCtx = struct {
     audio_max_queue_bytes: u32,
 
     pub fn init(allocator: std.mem.Allocator, hw_decode: bool) !DecodeCtx {
-        c.av_log_set_level(c.AV_LOG_FATAL);
+        c.av_log_set_level(c.AV_LOG_TRACE);
         const ring = try PacketRing.init(allocator);
         return .{
             .allocator = allocator,
@@ -227,7 +226,6 @@ pub const DecodeCtx = struct {
             .audio_swr_ctx = null,
             .audio_device = 0,
             .audio_max_queue_bytes = 0,
-            .consecutive_bad_frames = 0,
             .manual_resize = false,
         };
     }
@@ -627,27 +625,6 @@ fn populateFrame(ctx: *DecodeCtx) bool {
     return true;
 }
 
-fn drainFrames(ctx: *DecodeCtx, codec_ctx: ?*c.AVCodecContext) bool {
-    while (!ctx.force_disconnect.load(.acquire)) {
-        const r = c.avcodec_receive_frame(codec_ctx, ctx.av_frame);
-        if (r == 0) {
-            if (populateFrame(ctx)) {
-                ctx.consecutive_bad_frames = 0;
-            } else {
-                ctx.consecutive_bad_frames += 1;
-                if (ctx.consecutive_bad_frames >= 30) {
-                    ctx.force_disconnect.store(true, .release);
-                }
-            }
-            continue;
-        }
-        if (r == c.AVERROR(c.EAGAIN) or r == c.AVERROR_EOF) break;
-        // Actual error receiving frame
-        return false;
-    }
-    return true;
-}
-
 fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
     if (ctx.video_codec_ctx) |old| {
         _ = c.avcodec_send_packet(old, null);
@@ -662,7 +639,6 @@ fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
     ctx.video_codec_ctx = cc;
     ctx.req_w = aligned_w;
     ctx.req_h = aligned_h;
-    ctx.consecutive_bad_frames = 0;
 }
 
 fn videoDecodeThread(ctx: *DecodeCtx) void {
@@ -672,6 +648,8 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
     const scratch = ctx.allocator.alloc(u8, SLOT_CAP) catch return;
     defer ctx.allocator.free(scratch);
 
+    var consecutive_bad_frames: u32 = 0;
+    const bad_frame_limit: u32 = 30;
     var waiting_for_keyframe = true;
 
     while (!ctx.force_disconnect.load(.acquire)) {
@@ -727,33 +705,40 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
         @memcpy(pkt.*.data[0..n], scratch[0..n]);
         if (is_keyframe) pkt.*.flags |= c.AV_PKT_FLAG_KEY;
 
-        var send_retries: u32 = 0;
-        send: while (!ctx.force_disconnect.load(.acquire)) {
-            const sret = c.avcodec_send_packet(codec_ctx, pkt);
-            if (sret == 0) break :send;
-            if (sret == c.AVERROR(c.EAGAIN)) {
-                if (drainFrames(ctx, codec_ctx)) {
-                    send_retries += 1;
-                    if (send_retries < 4) continue :send;
-                    // Secondary failsafe, shouldn't need a full codec rebuild here
-                    waiting_for_keyframe = true;
-                    ctx.need_keyframe.store(true, .release);
-                    continue;
-                }
-            }
+        if (c.avcodec_send_packet(codec_ctx, pkt) != 0) {
             if (ctx.manual_resize) {
                 const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
                 const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
                 rebuildCodec(ctx, fb_w, fb_h);
-            } else {
-                if (ctx.video_codec_ctx) |cc| c.avcodec_flush_buffers(cc);
             }
             waiting_for_keyframe = true;
             ctx.need_keyframe.store(true, .release);
             continue;
         }
 
-        _ = drainFrames(ctx, codec_ctx);
+        while (!ctx.force_disconnect.load(.acquire)) {
+            const r = c.avcodec_receive_frame(codec_ctx, ctx.av_frame);
+            if (r == 0) {
+                if (populateFrame(ctx)) {
+                    consecutive_bad_frames = 0;
+                } else {
+                    consecutive_bad_frames += 1;
+                    if (consecutive_bad_frames >= bad_frame_limit) {
+                        ctx.force_disconnect.store(true, .release);
+                    }
+                }
+                break;
+            }
+            if (r == c.AVERROR(c.EAGAIN) or r == c.AVERROR_EOF) break;
+            if (ctx.manual_resize) {
+                const fb_w = if (ctx.last_sps_w > 0) ctx.last_sps_w else ctx.canvas_w;
+                const fb_h = if (ctx.last_sps_h > 0) ctx.last_sps_h else ctx.canvas_h;
+                rebuildCodec(ctx, fb_w, fb_h);
+            }
+            waiting_for_keyframe = true;
+            ctx.need_keyframe.store(true, .release);
+            break;
+        }
     }
 }
 
