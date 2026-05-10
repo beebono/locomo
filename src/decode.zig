@@ -190,7 +190,7 @@ pub const DecodeCtx = struct {
     audio_max_queue_bytes: u32,
 
     pub fn init(allocator: std.mem.Allocator, hw_decode: bool) !DecodeCtx {
-        c.av_log_set_level(c.AV_LOG_TRACE);
+        c.av_log_set_level(c.AV_LOG_FATAL);
         const ring = try PacketRing.init(allocator);
         return .{
             .allocator = allocator,
