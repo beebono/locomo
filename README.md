@@ -23,7 +23,7 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 - ARM64 Linux (aarch64)
 - VPU hardware for video decoding (software decoding also available)
 - EGL and OpenGL ES 2.0 for zero-copy DRM frame rendering
-- `libSDL2` available on the system
+- `libSDL2` and `librockchip_mpp` available on the system (Provided by build if needed)
 - A Steam host on the same local network with Remote Play enabled
 
 ### Build (Docker path - recommended)
@@ -34,7 +34,7 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 ### Build (native / manual path)
 
 - Zig 0.16.0
-- `wayland-scanner++`
+- `python3`, `wayland-scanner++`
 - ARM64 sysroot with: `libdbus`, `libibus`, `libdrm`, `libegl`, `libgles`, `libgbm`, `libasound2`, `libpulse`, `libwayland`, `libwayland-egl`, `libxkbcommon`, `libX11`, `libxext`, `libxrandr`, `libxcursor`, `libxi`
 
 ## Building
@@ -42,7 +42,7 @@ Locomo is a minimal Steam Remote Play client designed for ARM64 Linux handhelds.
 ### Clone
 
 ```sh
-git clone --recurse-submodules https://github.com/beebono/locomo.git
+git clone https://github.com/beebono/locomo.git
 cd locomo
 ```
 
@@ -52,10 +52,12 @@ cd locomo
 ./docker-build.sh
 ```
 
-This builds a Docker image with the full cross-compilation toolchain, bootstraps all library dependencies, then compiles locomo. The output binary is placed at:
+This builds a Docker image with the full cross-compilation toolchain, then uses zig to build all dependencies and locomo itself. The output binary and libraries are placed at:
 
 ```
 ./zig-out/bin/locomo
+./zig-out/lib/libSDL2-2.0.so.0
+./zig-out/lib/librockchip_mpp.so.1
 ```
 
 To target a different architecture, set `TARGET` before running:
@@ -71,8 +73,6 @@ Please note this is unlikely to work for targets other than aarch64 at the momen
 ```sh
 zig build -Doptimize=ReleaseFast
 ```
-
-The bootstrap script compiles all bundled library dependencies (mbedTLS, protobuf-c, SDL2, SDL2\_ttf, udev-zero, Rockchip MPP, FFmpeg) and installs them into `./libs/`. This only needs to run once, or after a clean.
 
 ## Usage
 

@@ -1,5 +1,149 @@
 const std = @import("std");
 
+pub fn build(b: *std.Build) void {
+    // Options
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Main executable
+    const exe = b.addExecutable(.{
+        .name = "locomo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = true,
+        }),
+    });
+    exe.lto = .thin;
+    exe.link_gc_sections = true;
+    const mod = exe.root_module;
+
+    // mbedTLS
+    const mbedtls_dep = b.dependency("mbedtls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const mbedtls_lib = mbedtls_dep.artifact("mbedtls");
+
+    // protobuf-c
+    const protobufc_dep = b.dependency("protobuf_c", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const protobufc_lib = protobufc_dep.artifact("protobuf_c");
+
+    // SDL2
+    const sdl_dep = b.dependency("SDL", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const sdl_lib = sdl_dep.artifact("SDL2-2.0");
+    sdl_lib.root_module.strip = true;
+    mod.linkLibrary(sdl_lib);
+
+    // SDL2_ttf
+    const sdlttf_dep = b.dependency("SDL_ttf", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const sdlttf_lib = sdlttf_dep.artifact("SDL2_ttf");
+    mod.linkLibrary(sdlttf_lib);
+
+    // ihslib
+    const ihslib_upstream = b.dependency("ihslib", .{});
+    const ihslib = b.addLibrary(.{
+        .name = "ihslib",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const ihslib_mod = ihslib.root_module;
+    ihslib_mod.addIncludePath(ihslib_upstream.path("src"));
+    ihslib_mod.addIncludePath(ihslib_upstream.path("src/hid/sdl/include"));
+    ihslib_mod.addIncludePath(ihslib_upstream.path("include"));
+    ihslib_mod.linkLibrary(mbedtls_lib);
+    ihslib_mod.linkLibrary(protobufc_lib);
+    ihslib_mod.addIncludePath(sdl_lib.getEmittedIncludeTree());
+    ihslib_mod.addIncludePath(protobufc_dep.path("."));
+    ihslib_mod.addCSourceFiles(.{
+        .root = ihslib_upstream.path("src"),
+        .files = ihslib_sources,
+        .flags = &.{ "-std=gnu11", "-DIHS_CRYPTO_MBEDTLS" },
+    });
+    mod.addIncludePath(ihslib_upstream.path("include"));
+    mod.addIncludePath(ihslib_upstream.path("src/hid/sdl/include"));
+    mod.linkLibrary(ihslib);
+
+    // ffmpeg
+    const ffmpeg_dep = b.dependency("ffmpeg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ffmpeg_lib = ffmpeg_dep.artifact("ffmpeg");
+    const mpp_lib = ffmpeg_dep.artifact("rockchip_mpp");
+    mod.linkLibrary(ffmpeg_lib);
+    mod.linkLibrary(mpp_lib);
+
+    // System libraries
+    mod.linkSystemLibrary("EGL", .{});
+    mod.linkSystemLibrary("GLESv2", .{});
+
+    // Multiarch/Cross handling
+    if (target.result.cpu.arch == .aarch64) {
+        mod.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+        mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/drm" });
+
+        sdl_lib.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+        sdl_lib.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+        sdl_lib.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/drm" });
+
+        sdlttf_lib.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+        sdlttf_lib.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+
+        ihslib_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+        ihslib_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    }
+
+    // Install step
+    const install_step = b.addInstallArtifact(exe, .{});
+    const install_sdl_lib = b.addInstallFile(sdl_lib.getEmittedBin(), "lib/libSDL2-2.0.so.0");
+    const install_mpp_lib = b.addInstallFile(mpp_lib.getEmittedBin(), "lib/librockchip_mpp.so.1");
+    b.getInstallStep().dependOn(&install_sdl_lib.step);
+    b.getInstallStep().dependOn(&install_mpp_lib.step);
+
+    // Run step
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+
+    const run_step = b.step("run", "Run locomo");
+    run_step.dependOn(&run_cmd.step);
+
+    // Test step
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const exe_tests = b.addTest(.{ .root_module = test_mod });
+    const run_tests = b.addRunArtifact(exe_tests);
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_tests.step);
+
+    // Informational message (since Docker eats almost all of Zig's output...?)
+    const msg = b.addSystemCommand(&.{
+        "echo",
+        "Build complete! Files are under ./zig-out/bin/",
+    });
+    msg.step.dependOn(&install_step.step);
+    b.getInstallStep().dependOn(&msg.step);
+}
+
 const ihslib_sources: []const []const u8 = &.{
     "base.c",
     "crc32.c",
@@ -67,141 +211,3 @@ const ihslib_sources: []const []const u8 = &.{
     "session/channels/video/frame_hevc.c",
     "session/channels/video/partial_frames.c",
 };
-
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    const exe = b.addExecutable(.{
-        .name = "locomo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = true,
-        }),
-    });
-    exe.lto = .thin;
-    exe.link_gc_sections = true;
-
-    const mod = exe.root_module;
-
-    // mbedTLS
-    const mbedtls_dep = b.dependency("mbedtls", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const mbedtls_lib = mbedtls_dep.artifact("mbedtls");
-
-    // protobuf-c
-    const protobufc_dep = b.dependency("protobuf_c", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const protobufc_lib = protobufc_dep.artifact("protobuf_c");
-
-    // SDL2
-    const sdl_dep = b.dependency("SDL", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const sdl_lib = sdl_dep.artifact("SDL2-2.0");
-    sdl_lib.root_module.strip = true;
-    mod.linkLibrary(sdl_lib);
-
-    // SDL2_ttf
-    const sdlttf_dep = b.dependency("SDL_ttf", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const sdlttf_lib = sdlttf_dep.artifact("SDL2_ttf");
-    mod.linkLibrary(sdlttf_lib);
-
-    // ihslib
-    const ihslib_upstream = b.dependency("ihslib", .{});
-    const ihslib = b.addLibrary(.{
-        .name = "ihslib",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    ihslib.root_module.addIncludePath(ihslib_upstream.path("src"));
-    ihslib.root_module.addIncludePath(ihslib_upstream.path("src/hid/sdl/include"));
-    ihslib.root_module.addIncludePath(ihslib_upstream.path("include"));
-    ihslib.root_module.linkLibrary(mbedtls_lib);
-    ihslib.root_module.linkLibrary(protobufc_lib);
-    ihslib.root_module.addIncludePath(sdl_lib.getEmittedIncludeTree());
-    ihslib.root_module.addIncludePath(protobufc_dep.path("."));
-    ihslib.root_module.addCSourceFiles(.{
-        .root = ihslib_upstream.path("src"),
-        .files = ihslib_sources,
-        .flags = &.{ "-std=gnu11", "-DIHS_CRYPTO_MBEDTLS" },
-    });
-    mod.addIncludePath(ihslib_upstream.path("include"));
-    mod.addIncludePath(ihslib_upstream.path("src/hid/sdl/include"));
-    mod.linkLibrary(ihslib);
-
-    // ffmpeg
-    const ffmpeg_dep = b.dependency("ffmpeg", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const ffmpeg_lib = ffmpeg_dep.artifact("ffmpeg");
-    const mpp_lib = ffmpeg_dep.artifact("rockchip_mpp");
-    mod.linkLibrary(ffmpeg_lib);
-    mod.linkLibrary(mpp_lib);
-
-    // System libraries
-    mod.linkSystemLibrary("EGL", .{});
-    mod.linkSystemLibrary("GLESv2", .{});
-
-    // Multiarch/Cross handling
-    if (target.result.cpu.arch == .aarch64) {
-        mod.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
-        mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-        mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/drm" });
-
-        sdl_lib.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
-        sdl_lib.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-        sdl_lib.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/drm" });
-
-        sdlttf_lib.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
-        sdlttf_lib.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-
-        ihslib.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
-        ihslib.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-    }
-
-    const install_step = b.addInstallArtifact(exe, .{});
-    const install_sdl_lib = b.addInstallFile(sdl_lib.getEmittedBin(), "lib/libSDL2-2.0.so.0");
-    const install_mpp_lib = b.addInstallFile(mpp_lib.getEmittedBin(), "lib/librockchip_mpp.so.1");
-    b.getInstallStep().dependOn(&install_sdl_lib.step);
-    b.getInstallStep().dependOn(&install_mpp_lib.step);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-
-    const run_step = b.step("run", "Run locomo");
-    run_step.dependOn(&run_cmd.step);
-
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const exe_tests = b.addTest(.{ .root_module = test_mod });
-    const run_tests = b.addRunArtifact(exe_tests);
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_tests.step);
-
-    const msg = b.addSystemCommand(&.{
-        "echo",
-        "Build complete! Files are under ./zig-out/bin/",
-    });
-    msg.step.dependOn(&install_step.step);
-    b.getInstallStep().dependOn(&msg.step);
-}
