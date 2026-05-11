@@ -32,6 +32,7 @@ fn onSessionConnected(
 ) callconv(.c) void {
     _ = session;
     const ctx: *SessionCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    std.log.info("[locomo - session] Stream connected.", .{});
     ctx.connected.store(true, .release);
 }
 
@@ -63,6 +64,7 @@ fn onSessionDisconnected(
 ) callconv(.c) void {
     _ = session;
     const ctx: *SessionCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    std.log.info("[locomo - session] Stream disconnected.", .{});
     ctx.disconnected.store(true, .release);
 }
 
@@ -199,15 +201,16 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var state = try initAppState(allocator);
     defer deinitAppState(&state);
 
+    std.log.info("[locomo] Application start. All aboard!", .{});
     while (true) {
         switch (state.phase) {
             .scan => scanForHosts(&state),
             .pair => pairWithPin(&state) catch |err| {
-                std.log.err("Pairing reported error: {}", .{err});
+                std.log.err("[locomo] Pairing reported error: {}", .{err});
                 state.phase = .scan;
             },
             .streaming => beginStreaming(&state) catch |err| {
-                std.log.err("Stream reported error: {}", .{err});
+                std.log.err("[locomo] Stream reported error: {}", .{err});
                 state.phase = .disconnected;
             },
             .disconnected => {
@@ -219,7 +222,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 settingsScreen(&state);
                 state.phase = .scan;
             },
-            .quit => break,
+            .quit => {
+                std.log.info("[locomo] Application close. Please disembark.", .{});
+                break;
+            },
         }
     }
 }
@@ -233,6 +239,7 @@ fn scanForHosts(state: *AppState) void {
     defer disc_ctx.deinit();
 
     const disc_thread = ihs.startDiscovery(&disc_ctx, cfg, 5000) catch {
+        std.log.err("[locomo - scan] Host discovery thread failed to start.", .{});
         state.ui.drawStatus("Discovery failed to start.");
         io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
         return;
@@ -388,6 +395,7 @@ fn beginStreaming(state: *AppState) !void {
 
     var session_info = stream_ctx.session_info;
     const session = c.IHS_SessionCreate(&cfg, &session_info) orelse {
+        std.log.err("[locomo - session] Internal IHSlib error when creating session.", .{});
         state.ui.drawStatus("Failed to create session.");
         io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
         state.phase = .disconnected;
@@ -413,6 +421,7 @@ fn beginStreaming(state: *AppState) !void {
 
     state.ui.drawStatus("Connecting...");
     if (!c.IHS_SessionConnect(session)) {
+        std.log.err("[locomo - session] Network error when conneting to host.", .{});
         state.ui.drawStatus("Session connect failed.");
         io.sleep(.fromNanoseconds(2000 * std.time.ns_per_ms), .awake) catch {};
         state.phase = .disconnected;
@@ -481,11 +490,13 @@ fn beginStreaming(state: *AppState) !void {
             }
             if (chords.observe(&event, state.settings.button_swap)) |action| switch (action) {
                 .disconnect => {
+                    std.log.info("[locomo - session] Disconnect chord triggered, ending stream.", .{});
                     c.IHS_SessionDisconnect(session);
                     break;
                 },
                 .toggle_mouse => {
                     mouse_mode = !mouse_mode;
+                    std.log.info("[locomo - session] Mouse mode set to {}.", .{mouse_mode});
                     mouse_state.reset(session, &cursor_state);
                 },
             };
@@ -498,7 +509,13 @@ fn beginStreaming(state: *AppState) !void {
             }
         }
 
-        if (state.phase == .quit or state.decode_ctx.force_disconnect.load(.acquire)) break;
+        if (state.phase == .quit) {
+            std.log.info("[locomo - session] Application is closing, ending stream.", .{});
+            break;
+        } else if (state.decode_ctx.force_disconnect.load(.acquire)) {
+            std.log.err("[locomo - decode] Encountered unrecoverable video error, ending stream.", .{});
+            break;
+        }
 
         if (mouse_mode) {
             mouse_state.tick(session, &cursor_state, last_host_w, last_host_h, Io.Clock.awake.now(io).toNanoseconds());
@@ -554,10 +571,12 @@ fn beginStreaming(state: *AppState) !void {
                     if (video_renderer == null) {
                         if (state.ui.gl_ctx) |gctx| {
                             video_renderer = gl.VideoRenderer.init(gctx) catch blk: {
+                                std.log.err("[locomo - render] Failed to create HW renderer. Video will not display.", .{});
                                 break :blk null;
                             };
                             if (video_renderer != null) {
                                 overlay = gl.OverlayRenderer.init(gctx) catch blk: {
+                                    std.log.err("[locomo - render] Failed to create Overlay renderer. Mouse mode and toasts will not display.", .{});
                                     break :blk null;
                                 };
                                 if (overlay != null) {

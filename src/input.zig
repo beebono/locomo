@@ -6,7 +6,10 @@ const Io = std.Io;
 const io = std.Options.debug_io;
 
 pub fn init(session: *c.IHS_Session) void {
-    const provider = c.IHS_HIDProviderSDLCreateManaged() orelse return;
+    const provider = c.IHS_HIDProviderSDLCreateManaged() orelse {
+        std.log.err("[locomo - input] Failed to setup input passthrough with host.", .{});
+        return;
+    };
     c.IHS_SessionHIDAddProvider(session, provider);
     _ = c.IHS_SessionHIDNotifyDeviceChange(session);
 }

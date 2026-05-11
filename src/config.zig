@@ -113,10 +113,12 @@ pub fn loadOrCreate(allocator: std.mem.Allocator) !DeviceConfig {
     if (Io.Dir.openFile(conf_dir, io, "device.json", .{})) |file| {
         defer file.close(io);
         const data = readFileToEnd(allocator, file) catch {
+            std.log.warn("[locomo - settings] Failed to access device.json, regenerating. May require new pair request to hosts.", .{});
             return generateAndSave(allocator, conf_dir);
         };
         defer allocator.free(data);
         const parsed = std.json.parseFromSlice(DeviceJson, allocator, data, .{}) catch {
+            std.log.warn("[locomo - settings] Failed to parse device.json, regenerating. May require new pair request to hosts.", .{});
             return generateAndSave(allocator, conf_dir);
         };
         defer parsed.deinit();
@@ -236,6 +238,7 @@ pub fn loadSettings(allocator: std.mem.Allocator) !Settings {
     const data = readFileToEnd(allocator, file) catch return Settings{};
     defer allocator.free(data);
     const parsed = std.json.parseFromSlice(Settings, allocator, data, .{}) catch {
+        std.log.warn("[locomo - settings] Invalid value(s) parsed from settings.json, resetting to defaults.", .{});
         const defaults = Settings{};
         saveSettings(allocator, defaults) catch {};
         return defaults;

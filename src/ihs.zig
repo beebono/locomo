@@ -267,6 +267,7 @@ fn streamRequestThread(args: StreamArgs) void {
 
     var host = args.host;
     if (!c.IHS_ClientStreamingRequest(client, &host, &req)) {
+        std.log.err("[locomo - session] Host actively refused the stream connection.", .{});
         args.ctx.result = .failed;
         args.ctx.done.store(true, .release);
         c.IHS_ClientDestroy(client);

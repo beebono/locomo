@@ -351,6 +351,7 @@ fn openSoftware(w: c_int, h: c_int, extradata: ?[]const u8, codec_id: c.AVCodecI
     cc.*.flags |= c.AV_CODEC_FLAG_LOW_DELAY;
     applyExtradata(cc, extradata);
     if (c.avcodec_open2(cc, codec, null) < 0) {
+        std.log.err("[locomo - decode] Failed to open SW decoder.", .{});
         c.avcodec_free_context(@ptrCast(@constCast(&cc)));
         return null;
     }
@@ -373,6 +374,7 @@ fn selectCodec(ctx: *DecodeCtx, codec_id: c.AVCodecID, hw_decode: bool, w: c_int
     };
     if (hw_decode) {
         if (deviceExists("/dev/mpp_service")) {
+            std.log.info("[locomo - decode] MPP service found, trying rkmpp codec.", .{});
             const mpp_cand = if (is_hevc) Candidate{
                 .name = "hevc_rkmpp",
                 .hw_type = c.AV_HWDEVICE_TYPE_RKMPP,
@@ -393,8 +395,10 @@ fn selectCodec(ctx: *DecodeCtx, codec_id: c.AVCodecID, hw_decode: bool, w: c_int
                 return cc;
             }
         }
-        std.log.warn("[locomo] No HW decoder available, falling back to SW\n", .{});
+        std.log.warn("[locomo - decode] No HW decoder available, falling back to SW", .{});
+        ctx.hw_decode = false;
     }
+    std.log.info("[locomo - decode] Opening SW decoder.", .{});
     return openSoftware(w, h, extradata, codec_id);
 }
 
@@ -419,7 +423,11 @@ fn videoStart(
         null;
     const width = alignUp16(@intCast(cfg.width));
     const height = alignUp16(@intCast(cfg.height));
-    const codec_ctx = selectCodec(ctx, codec_id, ctx.hw_decode, width, height, extradata) orelse return -1;
+    const codec_ctx = selectCodec(ctx, codec_id, ctx.hw_decode, width, height, extradata) orelse {
+        std.log.err("[locomo - decode] Unable to open any eligible video decoders.", .{});
+        return -1;
+    };
+    std.log.info("[locomo - decode] Selected video decoder: {s}", .{codec_ctx.*.codec.*.name});
 
     ctx.video_codec_ctx = codec_ctx;
     ctx.canvas_w = width;
@@ -435,11 +443,13 @@ fn videoStart(
     if (ctx.video_ring) |*r| r.reset();
     ctx.thread_exited.store(false, .release);
     ctx.video_thread = std.Thread.spawn(.{}, videoDecodeThread, .{ctx}) catch {
+        std.log.err("[locomo - decode] Failed to create video decode thread.", .{});
         c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
         ctx.video_codec_ctx = null;
         return -1;
     };
 
+    std.log.info("[locomo - decode] Video decode started.", .{});
     return 0;
 }
 
@@ -490,7 +500,10 @@ fn videoSubmit(
 
     if (ctx.need_keyframe.load(.acquire)) {
         if (!is_keyframe) {
-            if (tripFailsafe(ctx, now_ms)) ctx.force_disconnect.store(true, .release);
+            if (tripFailsafe(ctx, now_ms)) {
+                std.log.err("[locomo - decode] Didn't receive a keyframe for too long after last request, ending stream.", .{});
+                ctx.force_disconnect.store(true, .release);
+            }
             return c.IHS_StreamVideoSubmitReportLost;
         }
         ctx.need_keyframe.store(false, .release);
@@ -499,7 +512,10 @@ fn videoSubmit(
     if (!ring.tryPush(data_ptr[0..data_len], is_keyframe)) {
         ctx.video_lost.store(true, .release);
         ctx.need_keyframe.store(true, .release);
-        if (tripFailsafe(ctx, now_ms)) ctx.force_disconnect.store(true, .release);
+        if (tripFailsafe(ctx, now_ms)) {
+            std.log.err("[locomo - decode] Video buffers locked full for too long, ending stream.", .{});
+            ctx.force_disconnect.store(true, .release);
+        }
         return c.IHS_StreamVideoSubmitReportLost;
     }
 
@@ -513,7 +529,11 @@ fn populateFrame(ctx: *DecodeCtx) bool {
     defer c.av_frame_unref(av_frame);
 
     if (ctx.hw_decode and av_frame.format != c.AV_PIX_FMT_DRM_PRIME) {
-        std.log.warn("[locomo] HW decode was set, but received a non-DRM frame. Falling back to SW decode.\n", .{});
+        std.log.warn("[locomo - decode] HW decode was set, but received a non-DRM frame, falling back to SW decode.", .{});
+        std.log.warn("                  Got pixel format {s} from decoder {s}.", .{
+            c.av_get_pix_fmt_name(av_frame.format),
+            c.avcodec_get_name(ctx.codec_id),
+        });
         ctx.hw_decode = false;
         rebuildCodec(ctx, ctx.canvas_w, ctx.canvas_h);
         return false;
@@ -635,7 +655,10 @@ fn rebuildCodec(ctx: *DecodeCtx, w: c_int, h: c_int) void {
     ctx.video_codec_ctx = null;
     const aligned_w = alignUp16(@intCast(w));
     const aligned_h = alignUp16(@intCast(h));
-    const cc = selectCodec(ctx, ctx.codec_id, ctx.hw_decode, aligned_w, aligned_h, null) orelse return;
+    const cc = selectCodec(ctx, ctx.codec_id, ctx.hw_decode, aligned_w, aligned_h, null) orelse {
+        std.log.err("[locomo - decode] Failed to recreate decoder after Host requested resize.", .{});
+        return;
+    };
     ctx.video_codec_ctx = cc;
     ctx.req_w = aligned_w;
     ctx.req_h = aligned_h;
@@ -724,6 +747,7 @@ fn videoDecodeThread(ctx: *DecodeCtx) void {
                 } else {
                     consecutive_bad_frames += 1;
                     if (consecutive_bad_frames >= bad_frame_limit) {
+                        std.log.err("[locomo - decode] Received too many invalid frames, ending stream.", .{});
                         ctx.force_disconnect.store(true, .release);
                     }
                 }
@@ -785,9 +809,11 @@ fn audioStart(
     }
 
     if (c.avcodec_open2(codec_ctx, codec, null) < 0) {
+        std.log.err("[locomo - decode] Failed to open audio decoder.", .{});
         c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
         return -1;
     }
+    std.log.info("[locomo - decode] Selected audio decoder: {s}", .{codec_ctx.*.codec.*.name});
     ctx.audio_codec_ctx = codec_ctx;
 
     var want = std.mem.zeroes(c.SDL_AudioSpec);
@@ -801,6 +827,7 @@ fn audioStart(
 
     ctx.audio_device = c.SDL_OpenAudioDevice(null, 0, &want, null, 0);
     if (ctx.audio_device == 0) {
+        std.log.err("[locomo - decode] SDL returned error when opening audio device.", .{});
         c.avcodec_free_context(@ptrCast(@constCast(&codec_ctx)));
         ctx.audio_codec_ctx = null;
         return -1;

@@ -162,6 +162,7 @@ pub const VideoRenderer = struct {
             var log: [512]u8 = undefined;
             var n: c.GLsizei = 0;
             c.glGetProgramInfoLog(prog, log.len, &n, &log);
+            std.log.err("[locomo - render] Failed to link shader for video renderer: {s}", .{log});
             return error.GlLinkFailed;
         }
         c.glDeleteShader(vs);
@@ -284,6 +285,7 @@ pub const VideoRenderer = struct {
     ) bool {
         const desc: *c.AVDRMFrameDescriptor = @ptrCast(@alignCast(av_frame.data[0]));
         if (desc.nb_layers < 1) {
+            std.log.warn("[locomo - render] Received a HW frame with 0 layers, discarding.", .{});
             self.releaseFrame(av_frame);
             return false;
         }
@@ -294,7 +296,7 @@ pub const VideoRenderer = struct {
         {
             if (self.drawExternal(av_frame, desc, frame_w, frame_h, crop, viewport)) return true;
             self.ext_unavailable = true;
-            std.log.info("external-OES path unavailable; falling back to split-plane", .{});
+            std.log.warn("[locomo - render] external-OES path unavailable; falling back to split-plane", .{});
         }
 
         const Plane = struct { fd: c_int, offset: isize, pitch: isize, mod: u64, fc: u32 };
@@ -623,6 +625,7 @@ pub const OverlayRenderer = struct {
             var log: [512]u8 = undefined;
             var n: c.GLsizei = 0;
             c.glGetProgramInfoLog(prog, log.len, &n, &log);
+            std.log.err("[locomo - render] Failed to link shader for overlay renderer: {s}", .{log});
             return error.GlLinkFailed;
         }
         c.glDeleteShader(vs);

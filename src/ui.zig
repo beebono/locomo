@@ -47,8 +47,10 @@ pub const Ui = struct {
         var dm: c.SDL_DisplayMode = undefined;
         const display_idx: c_int = 0;
         const have_dm = c.SDL_GetCurrentDisplayMode(display_idx, &dm) == 0;
+        if (!have_dm) std.log.warn("[locomo - render] Couldn't detect display mode, defaulting to 1280x720.", .{});
         const screen_w: c_int = if (have_dm) dm.w else 1280;
         const screen_h: c_int = if (have_dm) dm.h else 720;
+        if (have_dm) std.log.info("[locomo - render] Detected resolution: {}x{}", .{ screen_w, screen_h });
 
         const window = c.SDL_CreateWindow(
             "Locomo",
@@ -65,6 +67,7 @@ pub const Ui = struct {
             return error.CreateRendererFailed;
 
         const gl_ctx: ?gl.GlCtx = gl.init() catch blk: {
+            std.log.warn("[locomo - render] Failed to start HW renderer, HW decode will not work.", .{});
             break :blk null;
         };
         errdefer c.SDL_DestroyRenderer(renderer);
